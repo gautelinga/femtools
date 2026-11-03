@@ -17,7 +17,7 @@ WORKER = os.path.join(HERE, "plaza_flip_worker.py")
 FREEZE_WORKER = os.path.join(HERE, "plaza_freeze_worker.py")
 
 
-@pytest.mark.parametrize("ranks", [1, pytest.param(3, marks=pytest.mark.mpi)])
+@pytest.mark.parametrize("ranks", [pytest.param(1, marks=pytest.mark.slow), pytest.param(3, marks=pytest.mark.mpi)])
 def test_faces_stay_paired_edge_by_edge(ranks, tmp_path):
     proc = support.run([sys.executable, WORKER, str(tmp_path / "sheared.h5")], ranks,
                        timeout=600)

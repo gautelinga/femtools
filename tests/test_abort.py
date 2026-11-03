@@ -32,6 +32,7 @@ def test_serially_nothing_changes():
     assert e.value.code == 3
 
 
+@pytest.mark.slow
 def test_an_abort_that_never_returns_is_ended_by_the_kernel():
     """`_abort` with an `MPI_Abort` that never returns:
     the kernel ends the process by SIGALRM after ABORT_GRACE, the message printed first."""
