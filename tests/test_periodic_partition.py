@@ -80,6 +80,70 @@ def test_the_repair_writes_nothing(results):
 
 
 
+
+WORKER_2D = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'periodic_partition_2d_worker.py')
+
+
+@pytest.fixture(scope='module')
+def results_2d(tmp_path_factory):
+    tmp = str(tmp_path_factory.mktemp('periodic_partition_2d'))
+    proc = support.run([sys.executable, WORKER_2D, tmp], 2, timeout=900)
+    return dict(line.split(None, 2)[1:] for line in proc.stdout.splitlines()
+                if line.startswith('RESULT '))
+
+
+@pytest.mark.mpi
+def test_on_triangles_the_crafted_partition_breaks_the_pairing_and_the_check_says_so(
+        results_2d):
+    """The defect on a triangle mesh: a vertex of a periodic edge held by a rank only
+    through a triangle touching the edge there."""
+    assert results_2d['endangered_crafted'] == '1'
+    assert results_2d['crafted_space_ok'] == 'False'
+
+
+@pytest.mark.mpi
+def test_on_triangles_the_repair_moves_the_cell_and_the_pairing_holds(results_2d):
+    assert results_2d['moved'] == '1'
+    assert results_2d['endangered_repaired'] == '0'
+    assert results_2d['repaired_log'] == '1'
+    assert results_2d['repaired_cells'] == '576'
+    assert results_2d['repaired_cell_ids'] == '1'
+    assert results_2d['repaired_space_ok'] == 'True'
+
+
+@pytest.mark.mpi
+def test_on_triangles_read_mesh_gives_a_correctly_paired_space(results_2d):
+    assert results_2d['read_mesh_cells'] == '576'
+    assert results_2d['read_mesh_space_ok'] == 'True'
+
+
+@pytest.mark.mpi
+def test_a_box_off_the_origin_is_checked_and_repaired(results_2d):
+    """A box centred at the origin: the check, given the lower corner, still sees the
+    broken pairing, and the repair (which needs the upper corner alone) fixes it."""
+    assert results_2d['centred_crafted_space_ok'] == 'False'
+    assert results_2d['centred_repaired_space_ok'] == 'True'
+
+
+@pytest.mark.parametrize('dim', [2, 3])
+def test_the_check_takes_the_lower_corner(dim):
+    """Serially, on a box centred at the origin: a periodic space passes the check given
+    the lower corner, and fails it taken from the origin, where the upper faces' images
+    land on the middle plane."""
+    import dolfin as df
+    from mpi4py import MPI
+    from femtools import periodic_partition as pp
+    from femtools.periodic import periodic_box
+    lo, hi = [-0.5] * dim, [0.5] * dim
+    mesh = (df.RectangleMesh(MPI.COMM_SELF, df.Point(*lo), df.Point(*hi), 6, 6) if dim == 2
+            else df.BoxMesh(MPI.COMM_SELF, df.Point(*lo), df.Point(*hi), 4, 4, 4))
+    periodic = [True] * dim
+    V = df.FunctionSpace(mesh, 'CG', 2, constrained_domain=periodic_box(hi, 1e-10, periodic, lo))
+    pp.check_space_pairing(V, hi, periodic, MPI.COMM_SELF, lower=lo)
+    with pytest.raises(pp.PairingError):
+        pp.check_space_pairing(V, hi, periodic, MPI.COMM_SELF)
+
 def _brute_dual(cells):
     """Every pair of cells sharing a face, both ways, by a dict of sorted triples."""
     seen, pairs = {}, set()
