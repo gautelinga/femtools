@@ -104,6 +104,7 @@ values = probes.array()
 
 ```bash
 femtools-cut-facets boundaries.xdmf walls.xdmf --markers 3,5,7:106
+femtools-cut-facets full.xdmf boundaries.xdmf --markers 1:    # every marker from 1
 femtools-build-dof-reorder --out libdof_reorder_star.so
 LD_PRELOAD=$PWD/libdof_reorder_star.so python3 solve.py
 ```

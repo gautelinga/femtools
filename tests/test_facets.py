@@ -50,6 +50,26 @@ def write_input(path, corners, facets, markers, name="f"):
 def test_selector():
     m = np.arange(12)
     assert np.flatnonzero(selector("3, 5,7:9")(m)).tolist() == [3, 5, 7, 8, 9]
+    assert np.flatnonzero(selector("2,9:")(m)).tolist() == [2, 9, 10, 11]
+    assert np.flatnonzero(selector("1:")(np.arange(12, dtype=np.uint64))).tolist() == \
+        list(range(1, 12))
+
+
+def test_an_open_range_cuts_a_full_file_to_its_nonzero_markers(tmp_path):
+    """`--markers 1:` on a full facet MeshFunction keeps every facet marked nonzero, on
+    the points they use, with their markers."""
+    corners, facets, markers = cube_facets()
+    src, out = str(tmp_path / "full.xdmf"), str(tmp_path / "boundary.xdmf")
+    write_input(src, corners, facets, markers)
+    assert main([src, out, "--markers", "1:"]) == 0
+    points, got, kept = read(out)
+    want = markers != 0
+    assert len(got) == want.sum() == 12 and set(kept.tolist()) == set(range(1, 7))
+    assert np.array_equal(np.unique(got), np.arange(len(points)))
+    assert len(points) == len(np.unique(facets[want])) == 8
+    before = {tuple(sorted(map(tuple, corners[f]))): int(m)
+              for f, m in zip(facets[want], markers[want])}
+    assert before == {tuple(sorted(map(tuple, points[f]))): int(m) for f, m in zip(got, kept)}
 
 
 def test_cut_keeps_the_selected_facets_on_their_points(tmp_path):

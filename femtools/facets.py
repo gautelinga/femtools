@@ -1,9 +1,11 @@
 """Cut a facet file down to the selected facets.
 
     femtools-cut-facets <in>.xdmf <out>.xdmf --markers 3,5,7:106
+    femtools-cut-facets <in>.xdmf <out>.xdmf --markers 1:
 
 writes <out>.xdmf and <out>.h5 in `femtools.boundaries`' layout: the facets whose marker
-the list selects (values and inclusive ranges), the points they use, renumbered, and their
+the list selects (values, inclusive ranges and open ranges `a:`, every marker from a), the
+points they use, renumbered, and their
 markers as a 1-D cell attribute `markers`. The input is any facet XDMF with HDF5 data,
 such as a facet MeshFunction dolfin writes, which holds every facet of the mesh."""
 import argparse
@@ -15,14 +17,17 @@ from femtools.boundaries import read
 
 
 def selector(spec):
-    """A predicate on an array of markers: `3,5,7:106` keeps 3, 5 and 7..106."""
+    """A predicate on an array of markers: `3,5,7:106` keeps 3, 5 and 7..106, `1:` every
+    marker from 1."""
     ranges = []
     for part in filter(None, (s.strip() for s in spec.split(","))):
-        lo, _, hi = part.partition(":")
-        ranges.append((int(lo), int(hi or lo)))
+        lo, colon, hi = part.partition(":")
+        hi = hi.strip()
+        ranges.append((int(lo), int(hi) if hi else None if colon else int(lo)))
     if not ranges:
         raise ValueError("no markers in {!r}".format(spec))
-    return lambda m: np.logical_or.reduce([(m >= a) & (m <= b) for a, b in ranges])
+    return lambda m: np.logical_or.reduce([(m >= a) & ((m <= b) if b is not None else True)
+                                           for a, b in ranges])
 
 
 def cut(infile, outfile, spec):
@@ -47,7 +52,7 @@ def main(argv=None):
                                 description=__doc__.splitlines()[0])
     p.add_argument("infile", help="facet file (.xdmf)")
     p.add_argument("outfile", help="cut facet file (.xdmf); its .h5 beside it")
-    p.add_argument("--markers", required=True, help="markers kept, as 3,5,7:106")
+    p.add_argument("--markers", required=True, help="markers kept, as 3,5,7:106; 1: every marker from 1")
     a = p.parse_args(argv)
     try:
         facets, points, markers = cut(a.infile, a.outfile, a.markers)
