@@ -1,56 +1,74 @@
 # femtools
 
-Tools for solvers written in legacy dolfin (FEniCS 2019.2):
+Tools for solvers written in legacy dolfin (FEniCS 2019.2), gathered from the solvers that
+needed them (stokes-beadpack, addictif, twoasis) so that each is written once. The parts that
+do not touch dolfin also serve readers without it, such as partrac's tools.
 
-- `femtools.xdmf.XDMFFile2`: a drop-in for `dolfin.XDMFFile` that keeps the midside
-  nodes of a quadratic field (`Tetrahedron_10`), writes several fields onto one grid,
-  lets a MeshFunction share a file with Functions, and compresses every dataset.
-- `femtools.xdmf.grids` and `femtools.xdmf.parse_xdmf`: where the HDF5 arrays of every
-  step of an XDMF file are; `parse_xdmf` returns them as partractools' `parse_xdmf` does.
-- `femtools.xdmfread`: datasets of an XDMF + HDF5 file read with their gzip chunks
-  inflated on a thread pool, whole or a chunk-row at a time, for meshes of billions of cells.
-- `femtools.compress`, `femtools.hdf5_rows`: compressed HDF5 datasets, and rows of them
-  read, written and exchanged between MPI ranks without any rank holding a whole one.
-- `femtools.facets` and `femtools-cut-facets`: a facet XDMF cut down to the facets
-  with selected markers.
-- `femtools.probes`: `Probes` and `GradProbes`, values and gradients of a Function at
-  points, from fenicstools.
-- `femtools.gradient`: the weighted gradient matrix, from fenicstools.
-- `femtools.periodic`: `PeriodicBox` and `periodic_box` (compiled), the periodic box a
-  `constrained_domain` is built with, on 2D and 3D meshes; `faces_congruent`, whether
-  identified faces carry the same nodes.
-- `femtools.dolfin_layout`: a Mesh or Function written in the layout
-  `dolfin.HDF5File.write` gives it, compressed; `write_mesh_arrays` without dolfin.
-- `femtools.periodic_partition`: `read_mesh`, a mesh read in blocks and partitioned by
-  ParMETIS so that dolfin's parallel periodic dofmap pairs every face entity;
-  `check_pairing`, `repartition`.
-- `femtools.plaza_periodic`: `refine_periodic`, dolfin's Plaza refinement with the
-  identified faces of a periodic box bisected alike, serial or under MPI, with the
-  parent-cell map; cell caps and frozen edges.
-- `femtools.refine_periodic`: `refine_congruent`, that refinement with the faces checked
-  congruent after it; `compute_box`, `dorfler_threshold`.
-- `femtools.hierarchical_transfer`: fields evaluated on a refined mesh through its
-  ancestor cells, no search: P1 and P2, from arrays or from a stored Function fetched cell
-  by cell (`DistributedCellSource`).
-- `femtools.dof_reorder` and `femtools-build-dof-reorder`: dolfin's dof ordering with a
-  star a cell for its graph, built as a library to preload over libdolfin's.
-- `femtools.abort`: `run(main)`, a command's entry point under MPI: an uncaught exception
-  on one rank aborts the job instead of hanging it.
-- `femtools.memory`: `release` and `drop`, freed heap handed back to the operating system.
+## Features
 
-`import femtools` needs numpy and h5py only. dolfin, mpi4py and scipy are imported
-where they are used; `femtools.probes` and `femtools.gradient` compile their C++ with
-cppimport (and pybind11, a compiler and `libdolfin-dev`) the first time they are
-imported, `femtools.periodic`, `femtools.periodic_partition` and
-`femtools.plaza_periodic` with dolfin's JIT the first time they are used.
-`femtools-build-dof-reorder` needs a compiler, `pkg-config`, `nm`, `ldd` and `objdump`. `femtools.periodic_partition` needs a ParMETIS with a 64-bit
-`idx_t` for meshes past 2^31 cells; it opens `$PETSC_DIR/$PETSC_ARCH/lib/libparmetis.so`
-first, then the system's.
+### Files: XDMF and HDF5
+
+- **`xdmf.XDMFFile2`**: a drop-in for `dolfin.XDMFFile` that writes dolfin's own layout but
+  keeps the midside nodes of a P2 field (`Tetrahedron_10`, `Triangle_6`); dolfin's
+  interpolates them away silently. It also writes several fields on one grid and compresses
+  every dataset.
+- **`xdmf.grids`, `xdmf.parse_xdmf`**: where every step's HDF5 arrays are, in one reader;
+  `parse_xdmf` keeps the interface of partractools' function of that name.
+- **`xdmfread`**: reads datasets with their gzip chunks inflated on a thread pool, whole or
+  a chunk-row at a time. h5py inflates on one thread, which takes hours at billions of cells.
+- **`compress`, `hdf5_rows`**: compressed datasets, and rows of them read, written and
+  exchanged between MPI ranks without any rank holding a whole one.
+- **`dolfin_layout`**: a Mesh or Function written in the layout `dolfin.HDF5File` gives it,
+  compressed; `write_mesh_arrays` without dolfin.
+- **`boundaries`**: a boundary facet file (facets, an integer marker each, the points they
+  use), written serially or from blocks on many ranks, and read back. It is the layout
+  partrac's `wall_facets` reads.
+- **`facets`, `femtools-cut-facets`**: a facet file cut to the facets with selected markers,
+  such as a full dolfin facet MeshFunction to its walls.
+
+### Periodic meshes and refinement
+
+- **`periodic`**: `PeriodicBox` and the compiled `periodic_box`, the `constrained_domain` of
+  a 2D or 3D periodic box with any lower corner; `faces_congruent` checks identified faces.
+- **`periodic_partition`**: reads a mesh in blocks and partitions it with ParMETIS so that
+  dolfin's parallel periodic dofmap pairs every face entity, which dolfin's own partition
+  does not guarantee.
+- **`plaza_periodic`, `refine_periodic`**: dolfin's Plaza refinement with identified faces
+  bisected alike, serial or under MPI, with the parent-cell map. Plain refinement breaks the
+  periodic pairing.
+- **`hierarchical_transfer`**: P1 and P2 fields moved to a refined mesh through ancestor
+  cells, with no point search.
+
+### Point evaluation and gradients
+
+- **`probes`**: `Probes` and `GradProbes`, a Function's values and gradients at fixed
+  points, located once and evaluated many times. From Mikael Mortensen's fenicstools, as
+  extended in addictif.
+- **`gradient`**: the weighted gradient matrix, a P1 field's derivative at the nodes as one
+  matrix-vector product. From Mikael Mortensen's fenicstools, unchanged in what it computes.
+
+### Running at scale
+
+- **`dof_reorder`, `femtools-build-dof-reorder`**: dolfin's dof reordering with a sparser
+  graph, built as a library to preload over libdolfin's, without the memory peak of
+  dolfin's own at large sizes.
+- **`abort`**: `run(main)`, so an exception on one MPI rank ends the job instead of
+  hanging it.
+- **`memory`**: hands freed heap back to the operating system, and reports what a process
+  holds.
+
+## Requirements
+
+`import femtools` needs numpy and h5py only. dolfin, mpi4py and scipy are imported where
+they are used. `probes` and `gradient` compile their C++ with cppimport (pybind11, a
+compiler and `libdolfin-dev`) on first import; `periodic`, `periodic_partition` and
+`plaza_periodic` use dolfin's JIT on first use. `periodic_partition` needs a ParMETIS with
+64-bit `idx_t` past 2^31 cells.
 
 ## Install
 
-Into the interpreter that has dolfin, without dependencies (a pip mpi4py would be
-built against another MPI than dolfin's):
+Into the interpreter that has dolfin, without dependencies (a pip mpi4py would be built
+against another MPI than dolfin's):
 
 ```bash
 python3 -m pip install --user --break-system-packages --no-deps --no-build-isolation -e .
@@ -71,50 +89,43 @@ with XDMFFile2(mesh.mpi_comm(), "up.xdmf") as f:   # where dolfin.XDMFFile was
     f.write((u, p), 1.0)                            # two fields on one grid
 ```
 
-Open `up.xdmf` in ParaView and raise "Nonlinear Subdivision Level" to see the quadratic
-field.
-
-```bash
-femtools-cut-facets boundaries.xdmf walls.xdmf --markers 3,5,7:106
-```
+In ParaView, raise "Nonlinear Subdivision Level" to see the quadratic field.
 
 ```python
 from femtools.periodic import periodic_box
 V = df.FunctionSpace(mesh, "CG", 2, constrained_domain=periodic_box(
     upper=(Lx, Ly), periodic=(True, False), lower=(0, 0)))
-```
 
-```python
-from femtools.refine_periodic import compute_box, refine_congruent
-from femtools.hierarchical_transfer import transfer_p1_field
-markers = df.MeshFunction("bool", mesh, 3, True)
-new, _, parent = refine_congruent(mesh, markers, compute_box(mesh), axes=[0, 1])
-values = transfer_p1_field(mesh, f.compute_vertex_values(mesh), new, parent)
-```
-
-```bash
-femtools-build-dof-reorder --out libdof_reorder_star.so
-LD_PRELOAD=$PWD/libdof_reorder_star.so python3 solve.py
-```
-
-```python
 from femtools.probes import Probes
 probes = Probes(points.flatten(), V)
 probes(u)
 values = probes.array()
 ```
 
+```bash
+femtools-cut-facets boundaries.xdmf walls.xdmf --markers 3,5,7:106
+femtools-build-dof-reorder --out libdof_reorder_star.so
+LD_PRELOAD=$PWD/libdof_reorder_star.so python3 solve.py
+```
+
 ## Tests
 
 ```bash
-python3 -m pytest tests
+python3 -m pytest              # the quick tier, seconds
+python3 -m pytest -m slow      # the mpirun and compile tests, minutes
+python3 -m pytest -m ""        # everything
 ```
 
-The dolfin tests skip where dolfin is missing; `-m "not slow"` leaves out the ones
-that spawn `mpirun`.
+The dolfin tests skip where dolfin is missing.
 
-## Licence
+## Credits and licence
 
-LGPL-3.0-or-later (COPYING.LESSER, COPYING). The probes and the gradient matrix come
-from fenicstools, the periodic Plaza refinement and the dof reordering from DOLFIN: see
-NOTICE.
+- **Probes and the weighted gradient matrix:** Mikael Mortensen's
+  [fenicstools](https://github.com/mikaem/fenicstools), Copyright (C) 2011–2013 Mikael
+  Mortensen. The probes come through addictif's extended copy (adding `GradProbes`).
+- **Periodic Plaza refinement and the dof reordering:** adapted from
+  [DOLFIN](https://bitbucket.org/fenics-project/dolfin) 2019.2, Copyright (C) 2008–2015
+  Anders Logg, Ola Skavhaug, Garth N. Wells and others.
+
+Both are LGPL-3.0-or-later, and their files keep their headers; NOTICE lists what came from
+where and what changed. femtools is LGPL-3.0-or-later (COPYING.LESSER, COPYING).
