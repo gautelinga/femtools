@@ -5,8 +5,16 @@
 
 dolfin's XDMFFile interpolates a quadratic function down to one value per vertex,
 silently, so the picture loses everything the midside nodes carry. XDMF can hold
-quadratic tetrahedra (`Tetrahedron_10`), which ParaView renders once "Nonlinear
-Subdivision Level" is turned up; this writes those.
+quadratic tetrahedra (`Tetrahedron_10`) and quadratic triangles (`Triangle_6`),
+which ParaView renders once "Nonlinear Subdivision Level" is turned up; this writes
+those. Their nodes are the mesh's vertices, then one per edge at its midpoint -- the
+nodes of the unconstrained P2 space, so a periodic field is written on the whole
+mesh, both sides of the period included, each node with the field's value there.
+
+Every grid here is written with **three** coordinates (`GeometryType="XYZ"`), a 2D
+mesh's with z = 0, whatever the cell or degree; dolfin writes a 2D mesh as `XY`, two
+columns, and meshio and ParaView take either. A 2D vector is padded to three
+components, as dolfin pads it.
 
 ## What `XDMFFile2` covers
 
@@ -24,7 +32,7 @@ what it produces, and a reader that copes with one copes with the other:
 It differs from `dolfin.XDMFFile` in exactly four ways, all of them deliberate:
 
 - **A degree-2 Function keeps its midside nodes.** dolfin throws them away without
-  saying so; this writes `Tetrahedron_10`.
+  saying so; this writes `Tetrahedron_10` or `Triangle_6`.
 - **`write((u, p))` writes several functions onto one node set.** dolfin takes one
   function per call; several sharing a grid are then certainly registered against
   each other, and the mesh is stored once instead of once per field.
@@ -74,6 +82,21 @@ XDMF_EDGES = ((0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3))
 DOLFIN_EDGES = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))
 # XDMF slot -> dolfin local node, corners first
 XDMF_ORDER = [0, 1, 2, 3] + [4 + DOLFIN_EDGES.index(e) for e in XDMF_EDGES]
+
+# The same three for Triangle_6: three corners, then the midsides of (0, 1), (1, 2)
+# and (2, 0) in XDMF's order (VTK's), and of the edges opposite corners 0, 1, 2 in
+# dolfin's -- its local edge i is the one not touching vertex i, as on a tetrahedron.
+XDMF_TRIANGLE_EDGES = ((0, 1), (1, 2), (0, 2))
+DOLFIN_TRIANGLE_EDGES = ((1, 2), (0, 2), (0, 1))
+XDMF_TRIANGLE_ORDER = [0, 1, 2] + [3 + DOLFIN_TRIANGLE_EDGES.index(e)
+                                   for e in XDMF_TRIANGLE_EDGES]
+
+# cell name -> (corners, XDMF's midside edges, XDMF slot -> dolfin local node), for
+# the cells a degree-2 Function is written on
+QUADRATIC = {
+    'tetrahedron': (4, XDMF_EDGES, XDMF_ORDER),
+    'triangle': (3, XDMF_TRIANGLE_EDGES, XDMF_TRIANGLE_ORDER),
+}
 
 XI = 'http://www.w3.org/2001/XInclude'
 DOCTYPE = '<!DOCTYPE Xdmf SYSTEM "Xdmf.dtd" []>'
@@ -485,9 +508,11 @@ class XDMFFile2(object):
 
     dolfin's own XDMFFile interpolates any Function down to one value per vertex
     before writing, so a P2 velocity comes out linear and the picture loses the
-    midside nodes. This writes
-    `Tetrahedron_10` cells instead, whose nodes are the P2 degrees of freedom, which
-    ParaView renders once "Nonlinear Subdivision Level" is raised.
+    midside nodes. This writes `Tetrahedron_10` cells on a tetrahedral mesh and
+    `Triangle_6` cells on a triangle mesh instead, whose nodes are the P2 degrees of
+    freedom, which ParaView renders once "Nonlinear Subdivision Level" is raised. A
+    P1 Function goes on the linear cells, as dolfin writes it. The coordinates are
+    always three, a 2D mesh's with z = 0, where dolfin writes two.
 
     Everything else dolfin's XDMFFile does, this does too, in dolfin's own file
     layout -- see the module docstring for the surface and for the three deliberate
@@ -1091,9 +1116,10 @@ class XDMFFile2(object):
         """Reads dolfin's checkpoint, or a quadratic grid written here.
 
         dolfin's reader knows only its own checkpoint format. If the file instead
-        holds `Tetrahedron_10` visualisation grids -- which dolfin cannot read at all
-        -- the field is rebuilt from the nodes, onto an unconstrained space, and then
-        interpolated onto whatever space `u` lives in. Going through the
+        holds `Tetrahedron_10` or `Triangle_6` visualisation grids -- which dolfin
+        cannot read at all -- the field is rebuilt from the nodes, onto an
+        unconstrained space, and then interpolated onto whatever space `u` lives
+        in. Going through the
         unconstrained space is what makes it safe for a periodic one, where matching
         dof coordinates does not line up node for node.
 
@@ -1157,8 +1183,8 @@ class XDMFFile2(object):
 
         A file with no quadratic grid in it is handed to dolfin, which reads its own
         layout -- and ours, which is the same one -- with no help from here. Only a
-        file holding `Tetrahedron_10`, which dolfin's reader cannot parse, is read
-        here instead.
+        file holding `Tetrahedron_10` or `Triangle_6`, which dolfin's reader cannot
+        parse, is read here instead.
         """
         import dolfin as df
         grids = _scan(self.path)
@@ -1719,9 +1745,10 @@ def _check_functions(functions):
 
     It used to be asked only inside `_function_nodes`, which the parallel path does
     not go through -- so on more than one rank a DG function was quietly interpolated
-    onto a Lagrange space and written as though it had been continuous all along, and
-    a P2 field on a triangle mesh died with an IndexError out of `conn[:, XDMF_ORDER]`
-    instead of being told it is not a tetrahedron.
+    onto a Lagrange space and written as though it had been continuous all along.
+
+    Degree 1 has no midsides and is written on any simplex. Degree 2 needs the
+    cell's midside numbering, which `QUADRATIC` holds for triangles and tetrahedra.
     """
     spaces = [f.function_space() for f in functions]
     mesh = spaces[0].mesh()
@@ -1740,13 +1767,10 @@ def _check_functions(functions):
     cellname = mesh.ufl_cell().cellname()
     if cellname not in ('interval', 'triangle', 'tetrahedron'):
         raise ValueError('{} cells are not something this writes'.format(cellname))
-    if degree == 2 and cellname != 'tetrahedron':
-        # the midside numbering below is the tetrahedron's; degree 1 has no
-        # midsides and works on any simplex, and refusing it was a regression --
-        # a P1 field on a triangle mesh is a format dolfin writes and so must this
-        raise ValueError('quadratic functions are written only on tetrahedra, '
-                         'not {}; use dolfin.XDMFFile (which drops the midsides)'
-                         .format(cellname))
+    if degree == 2 and cellname not in QUADRATIC:
+        raise ValueError('quadratic functions are written on triangles and '
+                         'tetrahedra, not {}; use dolfin.XDMFFile (which drops the '
+                         'midsides)'.format(cellname))
     widths = [int(np.prod(f.value_shape())) if len(f.value_shape()) else 1
               for f in functions]
     return mesh, degree, widths
@@ -1798,15 +1822,17 @@ def _function_nodes(functions):
         n_edge = mesh.num_entities_global(1)
         vertices = _pad_coords(mesh.coordinates())
         ends = _connectivity(mesh, 1)
-        # dolfin numbers a cell's six local edges by the vertex pairs DOLFIN_EDGES
-        # names -- checked, not assumed, and _check_midsides catches it if it moves
+        # dolfin numbers a cell's local edges by the vertex pairs DOLFIN_EDGES (or
+        # DOLFIN_TRIANGLE_EDGES) names -- checked, not assumed, and _check_midsides
+        # catches it if it moves
         cell_edges = _connectivity(mesh, tdim, 1)
         mid = gather_global(mpi, gedge,
                         0.5 * (vertices[ends[:, 0]] + vertices[ends[:, 1]]), n_edge)
         edge_conn = gather_global(mpi, gcell, gedge[cell_edges], n_cell)
         if root:
             coords = np.vstack((coords, mid))
-            conn = np.hstack((conn, edge_conn + n_vert))[:, XDMF_ORDER]
+            order = QUADRATIC[mesh.ufl_cell().cellname()][2]
+            conn = np.hstack((conn, edge_conn + n_vert))[:, order]
 
     gathered, names = [], []
     for index, (func, width) in enumerate(zip(functions, widths)):
@@ -1840,7 +1866,7 @@ def _function_nodes(functions):
     if not root:
         return None, None, None, None, degree, mesh
     if degree == 2:
-        _check_midsides(coords, conn)
+        _check_midsides(coords, conn, mesh.ufl_cell().cellname())
     return coords, conn, gathered, names, degree, mesh
 
 
@@ -1931,7 +1957,7 @@ def _function_nodes_distributed(functions):
         ends = _connectivity(mesh, 1)
         mid = 0.5 * (vertices[ends[:, 0]] + vertices[ends[:, 1]])
         conn = np.hstack((conn, gedge[_connectivity(mesh, tdim, 1)] + n_vert))
-        conn = conn[:, XDMF_ORDER]
+        conn = conn[:, QUADRATIC[mesh.ufl_cell().cellname()][2]]
     cell_offset = _exscan(comm, len(conn))
 
     fields = []
@@ -1991,13 +2017,23 @@ def _scatter_nodes(target, space, coords, values, width, degree):
     # and `get_local` hold this rank's owned rows -- so the global numbers have to be
     # brought back to local ones, or rank one indexes a 180-row array at 342.
     first = space.dofmap().ownership_range()[0]
+    # The file holds three coordinates and a 2D mesh's dofs have two: the file's z
+    # must then be zero, or this is a 2D mesh being matched against a 3D one
+    gdim = space.mesh().geometry().dim()
+    if coords.shape[1] > gdim:
+        extra = np.abs(coords[:, gdim:]).max() if len(coords) else 0.0
+        if extra > 0.0:
+            raise ValueError(
+                'the file\'s nodes leave the plane of this {}D mesh by up to {:.3e}, '
+                'so it is not the mesh the field was written on'.format(gdim, extra))
+        coords = coords[:, :gdim]
     if width > 1:
         sub_dofs = [np.asarray(space.sub(c).dofmap().dofs()) - first
                     for c in range(width)]
-        x = space.tabulate_dof_coordinates().reshape(-1, 3)[sub_dofs[0]]
+        x = space.tabulate_dof_coordinates().reshape(-1, gdim)[sub_dofs[0]]
     else:
         sub_dofs = [np.asarray(space.dofmap().dofs()) - first]
-        x = space.tabulate_dof_coordinates().reshape(-1, 3)
+        x = space.tabulate_dof_coordinates().reshape(-1, gdim)
     tree = cKDTree(coords)
     distance, index = tree.query(x)
     scale = max(np.ptp(coords, axis=0).max(), 1.0)
@@ -2015,23 +2051,24 @@ def _scatter_nodes(target, space, coords, values, width, degree):
     vector.apply('insert')
 
 
-def _check_midsides(coords, conn, sample=200):
+def _check_midsides(coords, conn, cellname='tetrahedron', sample=200):
     """Every midside node must lie on the edge it is named for.
 
     The node order is a convention -- dolfin's differs from XDMF's -- and getting it
     wrong writes cells that look plausible and are wrong. This is cheap and catches
     it, including after a distributed gather, where the numbering has been rebuilt.
     """
+    corners, edges, _ = QUADRATIC[cellname]
     rng = np.random.RandomState(0)
     pick = conn[rng.choice(len(conn), min(sample, len(conn)), replace=False)]
-    for k, (a, b) in enumerate(XDMF_EDGES):
-        off = np.abs(coords[pick[:, 4 + k]]
+    for k, (a, b) in enumerate(edges):
+        off = np.abs(coords[pick[:, corners + k]]
                      - 0.5 * (coords[pick[:, a]] + coords[pick[:, b]])).max()
         edge = np.linalg.norm(coords[pick[:, a]] - coords[pick[:, b]], axis=1).max()
         if off > 1e-9 * edge:
             raise ValueError(
                 'midside node {} sits {:.2e} off the edge it belongs to, so the '
-                'node ordering is wrong'.format(4 + k, off))
+                'node ordering is wrong'.format(corners + k, off))
 
 
 # ---------------------------------------------------------------------------
@@ -2205,10 +2242,12 @@ def write_quadratic_blocks(path, comm, cell_rows, conn, n_cells, node_rows, coor
         write_ordered(h5_path, 'VisualisationVector/{}'.format(index), node_rows, value,
                       n_nodes, comm, attrs=zero)
     if comm.Get_rank() == 0:
+        topology_type = MESHIO_TOPOLOGY.get(cell_type, cell_type)
         doc = XdmfDocument(path)
         grid = doc.grid('mesh')
-        doc.topology(grid, None, MESHIO_TOPOLOGY.get(cell_type, cell_type),
-                     ref='{}:/Mesh/mesh/topology'.format(h5_name), shape=(n_cells, 10))
+        doc.topology(grid, None, topology_type,
+                     ref='{}:/Mesh/mesh/topology'.format(h5_name),
+                     shape=(n_cells, TOPOLOGY_CELL[topology_type][1]))
         doc.geometry(grid, None, ref='{}:/Mesh/mesh/geometry'.format(h5_name),
                      shape=(n_nodes, 3))
         for index, (name, width) in enumerate(zip(names, widths)):
