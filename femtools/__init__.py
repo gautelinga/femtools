@@ -3,6 +3,7 @@
     femtools.xdmf        XDMFFile2, a drop-in for dolfin.XDMFFile that keeps P2
     femtools.compress    every HDF5 dataset shuffled and gzipped
     femtools.hdf5_rows   rows of HDF5 datasets read, written and exchanged between ranks
+    femtools.boundaries  a boundary facet file: facets with integer markers, written and read
     femtools.facets      a facet file cut to selected markers (femtools-cut-facets)
     femtools.probes      Probes and GradProbes, from fenicstools (compiled on import)
     femtools.gradient    the weighted gradient matrix, from fenicstools (compiled on import)
@@ -16,8 +17,8 @@
     femtools.abort       a command's entry point: one rank's failure ends the MPI job
     femtools.memory      freed heap handed back to the operating system
 
-`import femtools` imports none of them; xdmf, compress, hdf5_rows, facets, dolfin_layout
-and hierarchical_transfer need numpy and h5py alone, abort, memory and dof_reorder the
-standard library.
+`import femtools` imports none of them; xdmf, compress, hdf5_rows, boundaries, facets,
+dolfin_layout and hierarchical_transfer need numpy and h5py alone, abort, memory and
+dof_reorder the standard library.
 """
 __version__ = "0.1.0"

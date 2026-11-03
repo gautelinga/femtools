@@ -14,6 +14,7 @@ for name in ("dolfin", "mpi4py", "ufl", "ffc", "dijitso", "petsc4py"):
     sys.modules[name] = None
 import numpy as np
 import femtools, femtools.xdmf, femtools.compress, femtools.hdf5_rows, femtools.facets
+import femtools.boundaries
 import femtools.dolfin_layout, femtools.abort, femtools.memory
 import femtools.hierarchical_transfer, femtools.dof_reorder
 assert not any(m in sys.modules for m in ("cppimport", "femtools.probes", "femtools.gradient"))
