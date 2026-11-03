@@ -2066,6 +2066,45 @@ def _scan(path):
     return grids
 
 
+def grids(path):
+    """Every uniform grid of an XDMF file whose arrays are in HDF5, in order, as dicts:
+    'time' (None if it has none), 'geometry' and 'topology' as (HDF5 path, dataset),
+    'attributes' each attribute's name to the same, 'centers' its Center. A grid that takes
+    its mesh by xi:include, as the steps of dolfin's time series do, has the mesh of the
+    grid before it; times listed once for a collection (older dolfin) go to its grids in
+    order. Raises ValueError for data held in the XML."""
+    root = ET.parse(path).getroot()
+    base = os.path.dirname(os.path.abspath(path))
+    parent = {c: p for p in root.iter() for c in p}
+
+    def h5(node, what):
+        if node is None:
+            return None
+        fmt, ref, _ = _item(node.find('DataItem'))
+        if fmt != 'HDF':
+            raise ValueError('{}: {} is not in an HDF5 file'.format(path, what))
+        name, _, dataset = ref.partition(':')
+        return os.path.join(base, name), dataset
+
+    out, mesh = [], {'geometry': None, 'topology': None}
+    for grid in root.iter('Grid'):
+        if grid.get('GridType') == 'Collection':
+            continue
+        for key in mesh:
+            mesh[key] = h5(grid.find(key.capitalize()), key) or mesh[key]
+        time = grid.find('Time')
+        t = None if time is None or time.get('Value') is None else float(time.get('Value'))
+        up = parent.get(grid)
+        listed = None if up is None else up.find('Time/DataItem')
+        if t is None and listed is not None:
+            t = float(listed.text.split()[[g for g in up if g.tag == 'Grid'].index(grid)])
+        attributes = grid.findall('Attribute')
+        out.append(dict(time=t, **mesh,
+                        attributes={a.get('Name'): h5(a, a.get('Name')) for a in attributes},
+                        centers={a.get('Name'): a.get('Center') for a in attributes}))
+    return out
+
+
 def _item(node):
     """One DataItem as (format, reference, shape)."""
     if node is None:

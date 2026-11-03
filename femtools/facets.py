@@ -12,7 +12,7 @@ import os
 import numpy as np
 
 from femtools import compress
-from femtools.xdmf import _load, _scan
+from femtools.xdmf import grids
 
 
 def selector(spec):
@@ -29,14 +29,11 @@ def selector(spec):
 def read(xdmf):
     """`(points, facets, markers)` of the first grid of a facet file; `markers` the cell
     attribute named so, else the only cell attribute, else None."""
-    grids = _scan(xdmf)
-    if not grids:
+    import h5py
+    found = grids(xdmf)
+    if not found:
         raise ValueError(xdmf + ": no grid")
-    grid = grids[0]
-    for item in [grid["geometry_item"], grid["topology_item"]] + list(
-            grid["attributes"].values()):
-        if item[0] != "HDF":
-            raise ValueError("only HDF data is read, not {}".format(item[0]))
+    grid = found[0]
     cells = [n for n in grid["attributes"] if (grid["centers"][n] or "Cell") == "Cell"]
     if "markers" in cells:
         name = "markers"
@@ -46,9 +43,12 @@ def read(xdmf):
         raise ValueError("{} cell attributes, none named markers".format(len(cells)))
     else:
         name = None
-    points = _load(xdmf, grid["geometry_item"])
-    facets = _load(xdmf, grid["topology_item"]).reshape(grid["topology_item"][2])
-    markers = None if name is None else _load(xdmf, grid["attributes"][name]).ravel()
+
+    def load(where):
+        with h5py.File(where[0], "r") as h5:
+            return np.asarray(h5[where[1].lstrip("/")])
+    points, facets = load(grid["geometry"]), load(grid["topology"])
+    markers = None if name is None else load(grid["attributes"][name]).ravel()
     return points, facets, markers
 
 
