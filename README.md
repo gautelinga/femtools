@@ -22,7 +22,9 @@ do not touch dolfin also serve readers without it, such as partrac's tools.
   compressed; `write_mesh_arrays` without dolfin.
 - **`boundaries`**: a boundary facet file (facets, an integer marker each, the points they
   use), written serially or from blocks on many ranks, and read back. It is the layout
-  partrac's `wall_facets` reads.
+  partrac's `wall_facets` reads. `BoundaryMarkers` is a facet MeshFunction that writes its
+  marked exterior facets as that file and reads them back onto a mesh, on any number of
+  ranks.
 - **`facets`, `femtools-cut-facets`**: a facet file cut to the facets with selected markers,
   such as a full dolfin facet MeshFunction to its walls.
 
@@ -100,6 +102,15 @@ from femtools.probes import Probes
 probes = Probes(points.flatten(), V)
 probes(u)
 values = probes.array()
+```
+
+```python
+from femtools.boundaries import BoundaryMarkers
+markers = BoundaryMarkers(mesh)                     # where a facet MeshFunction was
+markers.mark(df.CompiledSubDomain("on_boundary && near(x[2], 0)"), 5)
+bc = df.DirichletBC(V, g, markers, 5)
+markers.write("boundaries.xdmf")                    # the exterior facets marked nonzero
+markers = BoundaryMarkers.read("boundaries.xdmf", mesh)
 ```
 
 ```bash

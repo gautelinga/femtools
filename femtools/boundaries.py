@@ -9,6 +9,9 @@ triangles in 3D, segments in 2D) and `markers` (int64) as a 1-D cell attribute n
 `markers`, every dataset compressed (`femtools.compress`). The layout partrac's
 `wall_facets` reads, and `femtools-cut-facets` writes. numpy and h5py; mpi4py only where
 a communicator is passed, dolfin never.
+
+    BoundaryMarkers(mesh)                 a facet MeshFunction written and read as this file
+                                          (femtools.boundary_markers; imports dolfin)
 """
 import os
 
@@ -85,11 +88,17 @@ def write(path, points, facets, markers, comm=None):
     return n_facets, n_points
 
 
-def read(xdmf):
-    """`(points, facets, markers)` of the first grid of a facet file; `markers` the cell
-    attribute named so, else the only cell attribute, else None. Reads this module's
-    files and any facet XDMF over HDF5, such as a facet MeshFunction dolfin writes."""
-    import h5py
+def __getattr__(name):
+    if name == "BoundaryMarkers":
+        from femtools.boundary_markers import BoundaryMarkers
+        return BoundaryMarkers
+    raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
+
+
+def datasets(xdmf):
+    """`(points, facets, markers)` of the first grid of a facet file as (HDF5 path,
+    dataset); `markers` the cell attribute named so, else the only cell attribute, else
+    None."""
     from femtools.xdmf import grids
     found = grids(xdmf)
     if not found:
@@ -104,11 +113,20 @@ def read(xdmf):
         raise ValueError("{} cell attributes, none named markers".format(len(cells)))
     else:
         name = None
+    return (grid["geometry"], grid["topology"],
+            None if name is None else grid["attributes"][name])
+
+
+def read(xdmf):
+    """`(points, facets, markers)` of the first grid of a facet file; `markers` the cell
+    attribute named so, else the only cell attribute, else None. Reads this module's
+    files and any facet XDMF over HDF5, such as a facet MeshFunction dolfin writes."""
+    import h5py
 
     def load(where):
         with h5py.File(where[0], "r") as h5:
             return np.asarray(h5[where[1].lstrip("/")])
-    points, facets = load(grid["geometry"]), load(grid["topology"])
-    markers = None if name is None else load(grid["attributes"][name]).ravel()
-    return points, facets, markers
+    points, facets, markers = datasets(xdmf)
+    points, facets = load(points), load(facets)
+    return points, facets, None if markers is None else load(markers).ravel()
 

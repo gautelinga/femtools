@@ -4,6 +4,7 @@
     femtools.compress    every HDF5 dataset shuffled and gzipped
     femtools.hdf5_rows   rows of HDF5 datasets read, written and exchanged between ranks
     femtools.boundaries  a boundary facet file: facets with integer markers, written and read
+    femtools.boundary_markers  BoundaryMarkers, a facet MeshFunction written and read as one
     femtools.facets      a facet file cut to selected markers (femtools-cut-facets)
     femtools.probes      Probes and GradProbes, from fenicstools (compiled on import)
     femtools.gradient    the weighted gradient matrix, from fenicstools (compiled on import)
