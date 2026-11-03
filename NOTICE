@@ -1,0 +1,32 @@
+femtools is licensed under the GNU Lesser General Public License, version 3 or (at
+your option) any later version (LGPL-3.0-or-later): COPYING.LESSER, with the GNU GPL
+version 3 it builds on in COPYING.
+
+Code derived from fenicstools
+=============================
+
+The following files come from fenicstools (https://github.com/mikaem/fenicstools),
+Copyright (C) 2011-2013 Mikael Mortensen <mikaem@math.uio.no>, and keep their headers:
+
+- femtools/probes.py and femtools/cpp/Probe.{h,cpp}, Probes.{h,cpp}, GradProbe.{h,cpp},
+  GradProbes.{h,cpp}, probe11.cpp: moved from addictif (addictif/common/fenicstools),
+  whose copy is a modified fork of fenicstools' Probes. Relative to upstream it adds
+  GradProbe and GradProbes and constructors that reuse already-located probes, and drops
+  StatisticsProbe(s). femtools changes how the module is compiled: cppimport builds
+  cpp/probe11.cpp from the file's own path when femtools.probes is imported.
+- femtools/gradient.py and femtools/cpp/gradient_weight.cpp: copied from upstream
+  fenicstools commit 03657ff (fenicstools/WeightedGradient.py and
+  fenicstools/fem/gradient_weight.cpp). femtools changes: the module is compiled from
+  the file's own path, `compute_weighted_gradient_matrix` and
+  `compute_DG0_to_CG_weight_matrix` are exposed at module level, and
+  `weighted_gradient_matrix` with a scalar index passes G where upstream passed an
+  undefined name A, and `dof_owner` throws for a dof in no process's range where
+  upstream fell off the end of the function without a return value.
+
+Upstream's licence statements differ. The file headers say
+`__license__ = "GNU Lesser GPL version 3 or any later version"` (Probe.py,
+WeightedGradient.py), and setup.py has the classifier
+`License :: OSI Approved :: GNU Library or Lesser General Public License (LGPL)`;
+README.md, section "Licence", says "fenicstools is licensed under the GNU GPL,
+version 3 or (at your option) any later version." femtools follows the file headers:
+LGPL-3.0-or-later.
