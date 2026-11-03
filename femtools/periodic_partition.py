@@ -9,8 +9,13 @@ other ranks sharing it is a comment with no code under it. A rank holding a vert
 an edge) of an upper periodic face only through cells that touch the face at a point
 or along an edge never learns it is a slave: it numbers it as an ordinary shared vertex
 (an extra, unconstrained dof) or keeps -1 plus its offset (**another vertex's dof**).
-Most face vertices have such cells, on any tetrahedral mesh, so whether it fires is up
-to where the partition happens to cut.
+Most face vertices have such cells, on any tetrahedral mesh, and on a triangle mesh a
+vertex of a periodic edge does too, so whether it fires is up to where the partition
+happens to cut. Everything here takes triangle and tetrahedron meshes.
+
+The box is given by its upper corner `L`, which is all the repair needs (it looks at
+the upper faces); the check also needs the lower corner, `lower`, the origin unless
+given.
 
 **The fix is the partition.** `read_mesh` reads the mesh in blocks and partitions it
 with ParMETIS, and `repaired` moves any rank's cells at an endangered slave entity to a
@@ -31,6 +36,7 @@ import os
 import numpy as np
 
 EDGES = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))     # dolfin's local edge order
+TRIANGLE_CELL_EDGES = ((1, 2), (0, 2), (0, 1))     # ... and a triangle's
 
 #: "on a face" for the repair and the check when the caller gives no tolerance: this
 #: times the box's largest side. A caller whose constraint has its own tolerance passes
@@ -42,10 +48,23 @@ def _face_tol(L, tol):
     return FACE_RTOL * float(np.max(L)) if tol is None else float(tol)
 
 
+def _as3(v, fill=0.0):
+    """An axis-wise sequence (L, lower, periodic) padded to three axes with `fill`."""
+    v = list(v)
+    return v + [fill] * (3 - len(v))
+
+
+def _cell_edges(nv):
+    """(the edges of a cell of `nv` vertices that can be slaves, the edges of a facet) in
+    dolfin's local numbering. On a triangle mesh an edge on a periodic face is a facet,
+    held with the cell that has it, so only vertices can be slaves there."""
+    return (EDGES, TRIANGLE_EDGES) if nv == 4 else ((), ())
+
+
 def upper_mask(x, L, periodic, tol):
     """Per vertex, bit `a` set when it lies on the upper face of periodic axis `a`."""
     m = np.zeros(len(x), np.uint8)
-    for a in range(3):
+    for a in range(min(np.shape(x)[1], len(periodic))):
         if periodic[a]:
             m |= (np.abs(x[:, a] - L[a]) < tol).astype(np.uint8) << a
     return m
@@ -118,9 +137,10 @@ def _endangered(mask, topo, owner):
     (keys, low))`, `bad` the rows (kind, a, b, rank) of slave entities a rank holds
     without an exterior facet there, `keys` every entity some rank has such a facet at
     and `low` the lowest of those ranks. Arrays throughout."""
-    faces = np.sort(np.stack([np.delete(topo, k, axis=1) for k in range(4)], 1), axis=2)
-    fcell = np.repeat(np.arange(len(topo)), 4)
-    ff = faces.reshape(-1, 3)
+    nv = topo.shape[1]
+    faces = np.sort(np.stack([np.delete(topo, k, axis=1) for k in range(nv)], 1), axis=2)
+    fcell = np.repeat(np.arange(len(topo)), nv)
+    ff = faces.reshape(-1, nv - 1)
     order = np.lexsort(ff.T[::-1])
     fs = ff[order]
     dup = np.all(fs[1:] == fs[:-1], axis=1)
@@ -129,8 +149,9 @@ def _endangered(mask, topo, owner):
     single[:-1] &= ~dup
     ext = order[single]
     ext = ext[(mask[ff[ext]] > 0).any(1)]   # only facets at an upper-face vertex matter
-    held = _held(topo, owner, mask, EDGES)
-    seen = _held(ff[ext], owner[fcell[ext]], mask, TRIANGLE_EDGES)
+    cell_edges, facet_edges = _cell_edges(nv)
+    held = _held(topo, owner, mask, cell_edges)
+    seen = _held(ff[ext], owner[fcell[ext]], mask, facet_edges)
     bad = held[_find_rows(held, seen) < 0]
     # seen is sorted: the first row of each entity has its lowest rank
     if len(seen):
@@ -161,7 +182,7 @@ def _repair(mask, topo, owner, max_rounds=50):
     starts = np.searchsorted(flat[by_vertex], np.arange(len(mask) + 1))
 
     def cells_of(v):
-        return by_vertex[starts[v]:starts[v + 1]] // 4
+        return by_vertex[starts[v]:starts[v + 1]] // topo.shape[1]
 
     moved = 0
     for _ in range(max_rounds):
@@ -199,13 +220,15 @@ _CODE = r"""
 #include <dolfin/mesh/LocalMeshData.h>
 #include <dolfin/mesh/MeshPartitioning.h>
 #include <dolfin/mesh/CellType.h>
+#include <stdexcept>
 namespace py = pybind11;
 using namespace dolfin;
 typedef Eigen::Matrix<std::int64_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> IMat;
 typedef Eigen::Matrix<std::int64_t, Eigen::Dynamic, 1> IVec;
 typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> DMat;
 
-// The distributed mesh `cells` (global vertex ids) with global ids `cell_ids`, the
+// The distributed mesh `cells` (global vertex ids; triangles or tetrahedra, by the number
+// of columns) with global ids `cell_ids`, the
 // vertices this rank holds being the block [vertex_offset, vertex_offset + rows(x)) of
 // the global numbering, as dolfin's own data for a mesh read from a file: with
 // `partition`, each local cell's destination rank. Filled first and built after
@@ -216,28 +239,32 @@ std::shared_ptr<LocalMeshData> local_data(
     std::int64_t n_global_cells, Eigen::Ref<const Eigen::VectorXi> partition)
 {
   auto data = std::make_shared<LocalMeshData>(like.mpi_comm());
-  data->topology.dim = 3;
-  data->topology.cell_type = CellType::Type::tetrahedron;
-  data->topology.num_vertices_per_cell = 4;
+  const int nv = cells.cols(), gdim = x.cols();
+  if (nv != 3 && nv != 4)
+    throw std::runtime_error("local_data: triangles or tetrahedra only");
+  data->topology.dim = nv - 1;
+  data->topology.cell_type = nv == 4 ? CellType::Type::tetrahedron
+                                     : CellType::Type::triangle;
+  data->topology.num_vertices_per_cell = nv;
   data->topology.num_global_cells = n_global_cells;
   const std::size_t n = cells.rows();
-  data->topology.cell_vertices.resize(boost::extents[n][4]);
+  data->topology.cell_vertices.resize(boost::extents[n][nv]);
   data->topology.global_cell_indices.resize(n);
   for (std::size_t i = 0; i < n; ++i)
   {
-    for (int j = 0; j < 4; ++j)
+    for (int j = 0; j < nv; ++j)
       data->topology.cell_vertices[i][j] = cells(i, j);
     data->topology.global_cell_indices[i] = cell_ids(i);
   }
   data->topology.cell_partition.assign(partition.data(), partition.data() + partition.size());
-  data->geometry.dim = 3;
+  data->geometry.dim = gdim;
   data->geometry.num_global_vertices = n_global_vertices;
   const std::size_t m = x.rows();
-  data->geometry.vertex_coordinates.resize(boost::extents[m][3]);
+  data->geometry.vertex_coordinates.resize(boost::extents[m][gdim]);
   data->geometry.vertex_indices.resize(m);
   for (std::size_t i = 0; i < m; ++i)
   {
-    for (int j = 0; j < 3; ++j)
+    for (int j = 0; j < gdim; ++j)
       data->geometry.vertex_coordinates[i][j] = x(i, j);
     data->geometry.vertex_indices[i] = vertex_offset + i;
   }
@@ -286,15 +313,16 @@ class Rebuild:
         # an empty mesh holds the communicator: a mesh's own is freed with it, and the
         # build runs after the caller has let `mesh` go
         self.like = df.Mesh(comm)
+        tdim = mesh.topology().dim()
         gv = np.asarray(mesh.topology().global_indices(0), dtype=np.int64)
-        gc = np.asarray(mesh.topology().global_indices(3), dtype=np.int64)
-        self.n = (mesh.num_entities_global(3), mesh.num_entities_global(0))
+        gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)
+        self.n = (mesh.num_entities_global(tdim), mesh.num_entities_global(0))
         self.ids = (gc, gv)
         cells = np.ascontiguousarray(gv[mesh.cells()])
         edges = block_edges(self.n[1], comm.size)
         got_i, got_x = to_owners(comm, edges, gv, mesh.coordinates())
         lo, hi = int(edges[comm.rank]), int(edges[comm.rank + 1])
-        x = np.empty((hi - lo, 3))
+        x = np.empty((hi - lo, mesh.geometry().dim()))
         seen = np.zeros(hi - lo, bool)
         x[got_i - lo], seen[got_i - lo] = got_x, True
         got_i = got_x = None
@@ -325,8 +353,9 @@ def rebuild(mesh, partition):
 
 
 def dual_graph_of(cells, comm):
-    """`(rows, cols, offset)`: the dual graph of this rank's cells `cells` (n, 4) of
-    global vertex ids -- two cells adjacent when they share a face, periodic images not --
+    """`(rows, cols, offset)`: the dual graph of this rank's cells `cells` (n, 4) or (n, 3)
+    of global vertex ids -- two cells adjacent when they share a facet, periodic images
+    not --
     in ParMETIS's numbering (local cell i is offset + i, offsets in rank order), as an
     edge list (rows local, cols global). Faces are named by their sorted global vertex ids
     and paired within the rank first (`local_dual`, C++: a sort of one 64-bit key a face,
@@ -334,24 +363,25 @@ def dual_graph_of(cells, comm):
     boundaries and the domain's -- through the rank a face hashes to. Collective."""
     from femtools.hdf5_rows import agreed, rank_of, route
     size, n = comm.size, len(cells)
+    nf = np.shape(cells)[1] - 1                      # a facet's vertices
     offset = comm.exscan(n) or 0
     rows, cols, f, o = _graph_module().local_dual(np.ascontiguousarray(cells, np.int64),
                                                   offset)
     rows, cols = [np.asarray(rows)], [np.asarray(cols)]
-    f, o = np.asarray(f).reshape(-1, 3), np.asarray(o)
+    f, o = np.asarray(f).reshape(-1, nf), np.asarray(o)
     # on one rank too: faces whose keys collided within it are paired here
     routed = route(comm, rank_of(f, size), np.concatenate([f, o[:, None]], 1))
     got, src = routed.received[0], np.repeat(np.arange(size), routed.recv_counts)
-    k = np.lexsort(got[:, 2::-1].T)
+    k = np.lexsort(got[:, nf - 1::-1].T)
     g, s_ = got[k], src[k]
-    same = np.all(g[1:, :3] == g[:-1, :3], axis=1)
+    same = np.all(g[1:, :nf] == g[:-1, :nf], axis=1)
     if agreed(comm, (same[1:] & same[:-1]).any()):
-        raise RuntimeError('dual graph: a face of three or more cells; the mesh is not a '
+        raise RuntimeError('dual graph: a facet of three or more cells; the mesh is not a '
                            'manifold, and no rank goes on')
     m = np.nonzero(same)[0]
     # each pair's two cells told of each other, at their own ranks
-    back = np.concatenate([np.stack([g[m, 3], g[m + 1, 3]], 1),
-                           np.stack([g[m + 1, 3], g[m, 3]], 1)])
+    back = np.concatenate([np.stack([g[m, nf], g[m + 1, nf]], 1),
+                           np.stack([g[m + 1, nf], g[m, nf]], 1)])
     e, = route(comm, np.concatenate([s_[m], s_[m + 1]]), back).received
     rows.append(e[:, 0] - offset)
     cols.append(e[:, 1])
@@ -486,18 +516,30 @@ static inline std::uint64_t mix(std::uint64_t x)
 py::tuple local_dual(Eigen::Ref<const IMat> cells, std::int64_t offset)
 {
   const std::int64_t n = cells.rows();
-  static const int drop[4][3] = {{1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+  const int nv = cells.cols(), nf = nv - 1;     // a cell's facets, and a facet's vertices
+  if (nv != 3 && nv != 4)
+    throw std::runtime_error("local_dual: triangles or tetrahedra only");
+  static const int drop4[4][3] = {{1, 2, 3}, {0, 2, 3}, {0, 1, 3}, {0, 1, 2}};
+  static const int drop3[3][3] = {{1, 2, 0}, {0, 2, 0}, {0, 1, 0}};
   auto tri = [&](std::int64_t f, std::int64_t* t) {
-    const std::int64_t c = f / 4;
-    for (int j = 0; j < 3; ++j) t[j] = cells(c, drop[f % 4][j]);
-    std::sort(t, t + 3);
+    const std::int64_t c = f / nv;
+    for (int j = 0; j < nf; ++j)
+      t[j] = cells(c, nv == 4 ? drop4[f % nv][j] : drop3[f % nv][j]);
+    std::sort(t, t + nf);
   };
-  std::vector<std::pair<std::uint64_t, std::int64_t>> key(4 * n);
+  auto same = [&](const std::int64_t* t, const std::int64_t* u) {
+    for (int j = 0; j < nf; ++j)
+      if (t[j] != u[j]) return false;
+    return true;
+  };
+  std::vector<std::pair<std::uint64_t, std::int64_t>> key(nv * n);
   std::int64_t t[3], u[3];
-  for (std::int64_t f = 0; f < 4 * n; ++f)
+  for (std::int64_t f = 0; f < nv * n; ++f)
   {
     tri(f, t);
-    key[f] = {mix(mix(mix(t[0]) ^ t[1]) ^ t[2]), f};
+    std::uint64_t k = mix(t[0]);
+    for (int j = 1; j < nf; ++j) k = mix(k ^ t[j]);
+    key[f] = {k, f};
   }
   std::sort(key.begin(), key.end());
   std::vector<std::int64_t> rows, cols, lone_t, lone_c;
@@ -509,9 +551,9 @@ py::tuple local_dual(Eigen::Ref<const IMat> cells, std::int64_t offset)
     if (b - a == 2)
     {
       tri(key[a].second, t); tri(key[a + 1].second, u);
-      if (t[0] == u[0] && t[1] == u[1] && t[2] == u[2])
+      if (same(t, u))
       {
-        const std::int64_t p = key[a].second / 4, q = key[a + 1].second / 4;
+        const std::int64_t p = key[a].second / nv, q = key[a + 1].second / nv;
         rows.push_back(p); cols.push_back(offset + q);
         rows.push_back(q); cols.push_back(offset + p);
         a = b;
@@ -523,8 +565,8 @@ py::tuple local_dual(Eigen::Ref<const IMat> cells, std::int64_t offset)
     for (std::size_t k = a; k < b; ++k)
     {
       tri(key[k].second, t);
-      lone_t.insert(lone_t.end(), t, t + 3);
-      lone_c.push_back(offset + key[k].second / 4);
+      lone_t.insert(lone_t.end(), t, t + nf);
+      lone_c.push_back(offset + key[k].second / nv);
     }
     a = b;
   }
@@ -653,12 +695,13 @@ class Families:
 
 
 def _box(mesh, L, comm):
-    """L as an array; None means the coordinates' extent (lower corner at the origin)."""
+    """L, the box's upper corner, as an array; None means the coordinates' largest values
+    (the repair looks at the upper faces alone, so the lower corner does not matter)."""
     if L is not None:
         return np.asarray(L, float)
     from mpi4py import MPI
     x = mesh.coordinates()
-    local = x.max(axis=0) if len(x) else np.full(3, -np.inf)
+    local = x.max(axis=0) if len(x) else np.full(mesh.geometry().dim(), -np.inf)
     return np.array([comm.allreduce(float(v), op=MPI.MAX) for v in local])
 
 
@@ -667,16 +710,18 @@ def _moves(mesh, L, periodic, comm, log, owner, tol=None):
     rank, from `owner` (each local cell's proposed rank)."""
     tol = _face_tol(L, tol)
     vmask = upper_mask(mesh.coordinates(), L, periodic, tol)
-    cells = mesh.cells()
-    cmask = vmask[cells] if len(cells) else np.zeros((0, 4), np.uint8)
+    tdim = mesh.topology().dim()
+    cells = np.asarray(mesh.cells(), np.int64).reshape(-1, tdim + 1)
+    cmask = vmask[cells]
     gv = np.asarray(mesh.topology().global_indices(0), dtype=np.int64)
-    gc = np.asarray(mesh.topology().global_indices(3), dtype=np.int64)
+    gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)
     return _layer_moves(comm, gc, gv[cells], cmask, owner, log)
 
 
 def _layer_moves(comm, gc, gcells, cmask, owner, log):
-    """`_moves` from arrays: each local cell's global id, its four global vertex ids, their
-    upper-face masks (`upper_mask`) and its proposed rank.
+    """`_moves` from arrays: each local cell's global id, its global vertex ids (four, or
+    three on a triangle mesh), their upper-face masks (`upper_mask`) and its proposed
+    rank.
 
     Only the layer -- the cells with a vertex on an upper periodic face, ~1 % of the
     mesh -- goes to rank 0, at ~50 B a cell (ids and masks, no coordinates): every facet
@@ -684,7 +729,8 @@ def _layer_moves(comm, gc, gcells, cmask, owner, log):
     and the repair on the layer alone is exact. Vertices are named by their global
     index, which every rank agrees on. Rank 0's repair is array work (`_repair`).
     """
-    cmask = np.asarray(cmask, np.uint8).reshape(-1, 4)
+    nv = np.shape(gcells)[1]
+    cmask = np.asarray(cmask, np.uint8).reshape(-1, nv)
     layer = np.nonzero((cmask > 0).any(1))[0]
     part = (np.asarray(gc, np.int64)[layer], np.asarray(gcells, np.int64)[layer],
             cmask[layer], np.asarray(owner, np.int64)[layer])
@@ -698,7 +744,7 @@ def _layer_moves(comm, gc, gcells, cmask, owner, log):
             owner = np.concatenate([p[3] for p in parts])
             del parts
             uniq, first, t = np.unique(vg, return_index=True, return_inverse=True)
-            fixed, moved = _repair(vm[first], t.reshape(-1, 4), owner)
+            fixed, moved = _repair(vm[first], t.reshape(-1, nv), owner)
             m = np.nonzero(fixed != owner)[0]
             moves = np.stack([ids[m], owner[m], fixed[m]], 1)
             log('periodic partition: {} cells moved of {} touching an upper face'
@@ -726,7 +772,7 @@ def repaired_partition(mesh, part, L, periodic, comm, log=print):
     """`part` (each local cell's rank) with the repair's moves applied: a partition the
     periodic dofmap cannot get wrong, decided before anything is built. Collective."""
     moves = _moves(mesh, _box(mesh, L, comm), periodic, comm, log, owner=part)
-    gc = np.asarray(mesh.topology().global_indices(3), dtype=np.int64)
+    gc = np.asarray(mesh.topology().global_indices(mesh.topology().dim()), dtype=np.int64)
     return _apply_moves(gc, part, moves), len(moves)
 
 
@@ -793,17 +839,18 @@ def read_partitioned(mesh_file, L, periodic, comm, log=print, tol=None, families
                else np.asarray(h[ids_name][a:b], dtype=np.int64))
         lo, hi = int(ve[comm.rank]), int(ve[comm.rank + 1])
         x = np.ascontiguousarray(h[coords_name][lo:hi], dtype=np.float64)
+        gdim = h[coords_name].shape[1]
     like = df.Mesh(comm)
     if families is None:
         part = _parmetis(like, dual_csr(cells, comm), adaptive=False)
     else:
         part = np.asarray(families(like, ids, comm), dtype=np.int64)
     if L is None:
-        local = x.max(axis=0) if len(x) else np.full(3, -np.inf)
+        local = x.max(axis=0) if len(x) else np.full(gdim, -np.inf)
         L = np.array([comm.allreduce(float(v), op=MPI.MAX) for v in local])
     L = np.asarray(L, float)
     vmask = upper_mask(x, L, periodic, _face_tol(L, tol))
-    cmask = lookup(comm, ve, vmask, cells.reshape(-1)).reshape(-1, 4)
+    cmask = lookup(comm, ve, vmask, cells.reshape(-1)).reshape(cells.shape)
     part = _apply_moves(ids, part, _layer_moves(comm, ids, cells, cmask, part, log))
     data = _cpp().local_data(like, cells, ids, x, lo, n_v, n_c, part.astype(np.int32))
     cells = ids = x = cmask = vmask = part = None       # dolfin's copy alone through the build
@@ -819,8 +866,8 @@ def read_mesh(mesh_file, L, periodic, comm, log=print, tol=None, families=None):
     """The mesh, distributed so that the periodic dofmap pairs every face entity.
 
     `mesh_file` is an XDMF mesh (the meshers') or a dolfin HDF5 mesh (`mesh.h5`,
-    `refined_mesh.h5`), whose global cell ids are kept. `L` may be None, the box then
-    being the coordinates' extent (every mesh here has its lower corner at the origin).
+    `refined_mesh.h5`), whose global cell ids are kept. `L` is the box's upper corner;
+    None takes the coordinates' largest values.
     Under MPI read in blocks, partitioned by ParMETIS and repaired before the one build
     (`read_partitioned`, by `families` if given); serially
     dolfin's plain read, the defect needing more than one rank.
@@ -846,8 +893,9 @@ def carry_by_id(old, new, cells=(), vertices=()):
     Each kind is packed into one int64 table (float64 and uint64 bit for bit, bools as
     0/1) and moved in one exchange (`hdf5_rows.move_rows`). Collective."""
     top = old.topology()
-    return _carry(old.mpi_comm(), (old.num_entities_global(3), old.num_entities_global(0)),
-                  (np.asarray(top.global_indices(3), dtype=np.int64),
+    tdim = top.dim()
+    return _carry(old.mpi_comm(), (old.num_entities_global(tdim), old.num_entities_global(0)),
+                  (np.asarray(top.global_indices(tdim), dtype=np.int64),
                    np.asarray(top.global_indices(0), dtype=np.int64)), new, cells, vertices)
 
 
@@ -879,7 +927,7 @@ def _carry(comm, n, ids, new, cells, vertices):
             out.append(part.reshape((len(after),) + np.asarray(a).shape[1:]))
         it = iter(out)
         return tuple(None if a is None else next(it) for a in arrays)
-    return move(0, 3, tuple(cells)), move(1, 0, tuple(vertices))
+    return move(0, new.topology().dim(), tuple(cells)), move(1, 0, tuple(vertices))
 
 
 def repartition(mesh, L, periodic, comm, log=print):
@@ -910,17 +958,25 @@ def repartition_plan(mesh, L, periodic, comm, log=print, propose=None):
     return Rebuild(mesh, part)
 
 
-def check_pairing(W, L, periodic, comm, tol=None):
+def _nodes_a_cell(tdim, degree):
+    """A Lagrange cell's nodes: its vertices, and for degree 2 its edge midpoints too."""
+    return tdim + 1 if degree == 1 else (tdim + 1) * (tdim + 2) // 2
+
+
+def check_pairing(W, L, periodic, comm, tol=None, lower=None):
     """Raise unless every face node of W carries its periodic class's one global dof.
 
     W is the Taylor-Hood mixed space; its velocity's first component and its pressure
-    are checked, at vertices and edge midpoints on every periodic face.
+    are checked, at vertices and edge midpoints on every periodic face. The box runs
+    from `lower` (default the origin) to `L`.
     """
-    _check(W.mesh(), [(W.sub(0).sub(0).dofmap(), 10), (W.sub(1).dofmap(), 4)],
-           L, periodic, comm, 'the Stokes space', tol=tol)
+    tdim = W.mesh().topology().dim()
+    _check(W.mesh(), [(W.sub(0).sub(0).dofmap(), _nodes_a_cell(tdim, 2)),
+                      (W.sub(1).dofmap(), _nodes_a_cell(tdim, 1))],
+           L, periodic, comm, 'the Stokes space', tol=tol, lower=lower)
 
 
-def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None):
+def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None, lower=None):
     """`check_pairing` for a Lagrange space of degree 1 or 2, scalar or vector (its first
     component stands for the rest: the components share one dofmap layout).
 
@@ -933,32 +989,46 @@ def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None):
         raise ValueError('check_space_pairing handles Lagrange degree 1 or 2, not {}'
                          .format(degree))
     dm = V.sub(0).dofmap() if V.num_sub_spaces() else V.dofmap()
-    _check(V.mesh(), [(dm, 4 if degree == 1 else 10)], L, periodic, comm, what, exempt)
+    _check(V.mesh(), [(dm, _nodes_a_cell(V.mesh().topology().dim(), degree))], L, periodic,
+           comm, what, exempt, lower=lower)
 
 
-def _check(mesh, dofmaps, L, periodic, comm, what, exempt=None, tol=None):
-    """Every face node, in every (dofmap, nodes a cell) given, one dof per periodic class."""
+def _pad3(x):
+    """Points (rows) with three coordinates, a 2D mesh's with a zero third."""
+    x = np.asarray(x, float)
+    return np.hstack([x, np.zeros((len(x), 3 - x.shape[1]))])
+
+
+def _check(mesh, dofmaps, L, periodic, comm, what, exempt=None, tol=None, lower=None):
+    """Every face node, in every (dofmap, nodes a cell) given, one dof per periodic class.
+    Triangle and tetrahedron meshes; the box runs from `lower` (default the origin) to
+    `L`."""
     from femtools.periodic import cell_dofs
-    x = mesh.coordinates()
-    cells = mesh.cells()
-    tol = _face_tol(L, tol)
+    x = _pad3(mesh.coordinates())
+    nv = mesh.topology().dim() + 1
+    cells = np.asarray(mesh.cells(), np.int64).reshape(-1, nv)
+    L = np.array(_as3(L), float)
+    lo = np.zeros(3) if lower is None else np.array(_as3(lower), float)
+    periodic = _as3(periodic, False)
+    tol = _face_tol(L - lo, tol)
     axes = [a for a in range(3) if periodic[a]]
     if not axes:
         return
     on = np.zeros(len(x), bool)
     for a in axes:
-        on |= (np.abs(x[:, a]) < tol) | (np.abs(x[:, a] - L[a]) < tol)
+        on |= (np.abs(x[:, a] - lo[a]) < tol) | (np.abs(x[:, a] - L[a]) < tol)
     touching = np.nonzero(on[cells].any(1))[0]
-    # the ten nodes of every touching cell -- vertices, then edge midpoints in dolfin's
+    # the nodes of every touching cell -- vertices, then edge midpoints in dolfin's
     # local edge order -- and which of them lie on a periodic face. Vectorised, with
     # the cells' dofs fetched in one compiled call (dolfin's Python has no bulk
-    # accessor); the same rows as the per-node loop it replaced
+    # accessor)
     xv = x[cells[touching]]
+    edges = EDGES if nv == 4 else TRIANGLE_CELL_EDGES
     nodes = np.concatenate(
-        [xv, np.stack([(xv[:, a] + xv[:, b]) / 2 for a, b in EDGES], 1)], 1)
+        [xv, np.stack([(xv[:, a] + xv[:, b]) / 2 for a, b in edges], 1)], 1)
     face = np.zeros(nodes.shape[:2], bool)
     for a in axes:
-        face |= (np.abs(nodes[..., a]) < tol) | (np.abs(nodes[..., a] - L[a]) < tol)
+        face |= (np.abs(nodes[..., a] - lo[a]) < tol) | (np.abs(nodes[..., a] - L[a]) < tol)
     pos = nodes[face]
     dofs = []
     for dm, n in dofmaps:
@@ -968,7 +1038,9 @@ def _check(mesh, dofmaps, L, periodic, comm, what, exempt=None, tol=None):
         g[:, :n] = l2g[cd]
         dofs.append(g[face])
     dofs = np.stack(dofs, 1) if dofs else np.zeros((len(pos), 0), np.int64)
-    split = _split_classes(comm, pos, dofs, L, axes, tol, exempt)
+    if exempt is not None:
+        exempt = _pad3(exempt)
+    split = _split_classes(comm, pos, dofs, L, axes, tol, exempt, lower=lo)
     if split:
         raise PairingError(
             'the periodic constraint left {} face node classes of {} with more than one '
@@ -983,7 +1055,7 @@ def _keys(pos, tol):
     return np.round(np.asarray(pos, float) / tol).astype(np.int64)
 
 
-def _split_classes(comm, pos, dofs, L, axes, tol, exempt):
+def _split_classes(comm, pos, dofs, L, axes, tol, exempt, lower=None):
     """How many periodic classes of face nodes carry more than one dof of some dofmap,
     and are not forgiven (every node of the class an exempt position), on every rank.
 
@@ -995,8 +1067,11 @@ def _split_classes(comm, pos, dofs, L, axes, tol, exempt):
     from femtools.hdf5_rows import as_rows, rank_of, route
     size = comm.Get_size()
     img = np.array(pos, float).reshape(-1, 3)
+    lo = np.zeros(3) if lower is None else np.asarray(lower, float)
     for a in axes:
-        img[:, a] = np.where(np.abs(img[:, a] - L[a]) < tol, img[:, a] - L[a], img[:, a])
+        # a node on an upper face, taken down to its image on the lower one
+        img[:, a] = np.where(np.abs(img[:, a] - L[a]) < tol, img[:, a] - (L[a] - lo[a]),
+                             img[:, a])
     rows = np.concatenate([_keys(pos, tol).reshape(-1, 3), _keys(img, tol),
                            as_rows(dofs)], 1)
     rows = rows[(rows[:, 6:] >= 0).any(1)] if rows.shape[1] > 6 else rows
