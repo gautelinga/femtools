@@ -7,6 +7,8 @@ Tools for solvers written in legacy dolfin (FEniCS 2019.2):
   lets a MeshFunction share a file with Functions, and compresses every dataset.
 - `femtools.xdmf.grids` and `femtools.xdmf.parse_xdmf`: where the HDF5 arrays of every
   step of an XDMF file are; `parse_xdmf` returns them as partractools' `parse_xdmf` does.
+- `femtools.xdmfread`: datasets of an XDMF + HDF5 file read with their gzip chunks
+  inflated on a thread pool, whole or a chunk-row at a time, for meshes of billions of cells.
 - `femtools.compress`, `femtools.hdf5_rows`: compressed HDF5 datasets, and rows of them
   read, written and exchanged between MPI ranks without any rank holding a whole one.
 - `femtools.facets` and `femtools-cut-facets`: a facet XDMF cut down to the facets
