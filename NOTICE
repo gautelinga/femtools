@@ -2,6 +2,20 @@ femtools is licensed under the GNU Lesser General Public License, version 3 or (
 your option) any later version (LGPL-3.0-or-later): COPYING.LESSER, with the GNU GPL
 version 3 it builds on in COPYING.
 
+Code derived from DOLFIN
+========================
+
+DOLFIN 2019.2 (https://bitbucket.org/fenics-project/dolfin), Copyright (C) 2008-2015
+Anders Logg, Ola Skavhaug, Garth N. Wells and others, is LGPL-3.0-or-later:
+
+- femtools/cpp/dof_reorder_star.cpp: `DofMapBuilder::compute_node_reordering`, copied and
+  keeping its header, with the reordering graph a star a cell instead of a clique; moved
+  from stokes-beadpack.
+- femtools/plaza_periodic.py: `PlazaRefinementND`'s `face_long_edge`, `enforce_rules` and
+  `do_refine`, reproduced in its C++ source with the periodic identification added to
+  `enforce_rules`, ties of the longest edge broken by position, and frozen edges; moved
+  from stokes-beadpack.
+
 Code derived from fenicstools
 =============================
 

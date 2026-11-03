@@ -20,12 +20,14 @@ test = ["pytest"]
 
 [project.scripts]
 femtools-cut-facets = "femtools.facets:main"
+femtools-build-dof-reorder = "femtools.dof_reorder:main"
 
 [tool.setuptools.packages.find]
 include = ["femtools*"]
 
 [tool.setuptools.package-data]
-# compiled by cppimport on import of femtools.probes or femtools.gradient, not before
+# compiled by cppimport on import of femtools.probes or femtools.gradient, not before;
+# cpp/dof_reorder_star.cpp by femtools-build-dof-reorder
 femtools = ["cpp/*.cpp", "cpp/*.h"]
 
 [tool.pytest.ini_options]

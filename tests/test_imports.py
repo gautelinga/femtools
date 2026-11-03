@@ -1,6 +1,7 @@
-"""`import femtools`, its I/O modules, `abort` and `memory` need numpy and h5py alone:
-dolfin and mpi4py made unimportable, they import without loading cppimport or the
-compiled modules, and a quadratic grid is written and read back."""
+"""`import femtools`, its I/O modules, `hierarchical_transfer`, `dof_reorder`, `abort` and
+`memory` need numpy and h5py alone: dolfin and mpi4py made unimportable, they import
+without loading cppimport or the compiled modules, and a quadratic grid is written and
+read back."""
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ for name in ("dolfin", "mpi4py", "ufl", "ffc", "dijitso", "petsc4py"):
 import numpy as np
 import femtools, femtools.xdmf, femtools.compress, femtools.hdf5_rows, femtools.facets
 import femtools.dolfin_layout, femtools.abort, femtools.memory
+import femtools.hierarchical_transfer, femtools.dof_reorder
 assert not any(m in sys.modules for m in ("cppimport", "femtools.probes", "femtools.gradient"))
 from femtools.xdmf import write_quadratic, _scan, _read_grid_geometry, _read_grid_attribute
 coords = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], float)

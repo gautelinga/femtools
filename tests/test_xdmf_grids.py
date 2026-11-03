@@ -1,4 +1,5 @@
-"""`femtools.xdmf.grids`: where the arrays of every grid of an XDMF file are.
+"""`femtools.xdmf.grids`: where the arrays of every grid of an XDMF file are; and
+`parse_xdmf`, partractools' interface to the same.
 
     python3 -m pytest tests/test_xdmf_grids.py
 
@@ -11,7 +12,7 @@ import os
 
 import pytest
 
-from femtools.xdmf import grids
+from femtools.xdmf import grids, parse_xdmf
 
 SERIES = """<?xml version="1.0"?>
 <Xdmf Version="3.0" xmlns:xi="http://www.w3.org/2001/XInclude">
@@ -117,3 +118,28 @@ def test_data_in_the_xml_is_refused(tmp_path):
         '<DataItem Dimensions="4 1" Format="XML">0 1 2 3</DataItem>'))
     with pytest.raises(ValueError, match="u is not in an HDF5 file"):
         grids(path)
+
+
+def test_parse_xdmf_gives_each_time_its_dataset_and_the_mesh(tmp_path):
+    path = write(tmp_path, SERIES)
+    h5 = os.path.join(str(tmp_path), "u.h5")
+    dsets, topology, geometry = parse_xdmf(path, get_mesh_address=True)
+    assert dsets == [(0.0, [h5, "/VisualisationVector/0"]), (0.5, [h5, "/VisualisationVector/1"])]
+    assert topology == [h5, "/Mesh/0/mesh/topology"]
+    assert geometry == [h5, "/Mesh/0/mesh/geometry"]
+    assert parse_xdmf(path) == dsets
+
+
+def test_parse_xdmf_takes_listed_times_and_keeps_a_relative_path_relative(tmp_path, monkeypatch):
+    write(tmp_path, LISTED)
+    monkeypatch.chdir(tmp_path)
+    assert parse_xdmf("f.xdmf") == [(0.25, ["sub/m.h5", "/p0"]), (0.75, ["sub/m.h5", "/p1"])]
+
+
+def test_parse_xdmf_reads_a_single_grid_as_one_step_without_a_time(tmp_path):
+    text = LISTED.split('<Grid Name="grid_1"', 1)[1].split("</Grid>", 1)[0]
+    path = write(tmp_path, '<?xml version="1.0"?>\n<Xdmf><Domain><Grid Name="grid_1"'
+                 + text + "</Grid></Domain></Xdmf>\n")
+    h5 = os.path.join(str(tmp_path), "sub", "m.h5")
+    assert parse_xdmf(path, get_mesh_address=True) == (
+        [(None, [h5, "/p0"])], [h5, "/topology"], [h5, "/coordinates"])

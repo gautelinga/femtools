@@ -2105,6 +2105,29 @@ def grids(path):
     return out
 
 
+def parse_xdmf(xml_file, get_mesh_address=False):
+    """partractools' `parse_xdmf` on `grids`: each grid's (time, [HDF5 file, dataset]) of
+    its last attribute, and with get_mesh_address the [HDF5 file, dataset] of the first
+    topology and geometry too. Files are joined onto the XDMF file's folder as given; a
+    file of one grid, not a series, gives one step, at time None."""
+    folder = os.path.dirname(xml_file)
+    base = os.path.dirname(os.path.abspath(xml_file))
+
+    def address(a):
+        return None if a is None else [os.path.join(folder, os.path.relpath(a[0], base)), a[1]]
+
+    steps = grids(xml_file)
+    dsets = [(g['time'], address(list(g['attributes'].values())[-1] if g['attributes'] else None))
+             for g in steps]
+    if not get_mesh_address:
+        return dsets
+    topology = next((g['topology'] for g in steps if g['topology']), None)
+    geometry = next((g['geometry'] for g in steps if g['geometry']), None)
+    if topology is None or geometry is None:
+        return dsets
+    return dsets, address(topology), address(geometry)
+
+
 def _item(node):
     """One DataItem as (format, reference, shape)."""
     if node is None:
