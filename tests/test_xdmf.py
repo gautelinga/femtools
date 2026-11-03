@@ -36,7 +36,7 @@ import numpy as np
 import dolfin as df                                            
 from femtools import xdmf as export_p2_xdmf
 from femtools.xdmf import (                             
-    XDMFFile2, XDMFParameters, XDMF_EDGES, XDMF_ORDER,
+    XDMFFile2, XDMFParameters, XDMF_EDGES, XDMF_ORDER, QUADRATIC,
     _scan, _read_grid_geometry, _read_grid_attribute)
 from tests import support
 
@@ -48,8 +48,29 @@ def tmp(filename):
     return os.path.join(TMP, filename)
 
 
-def unit_mesh(n=2):
+# the two cells a quadratic field is written on, for the cases that hold on both
+CELLS = pytest.mark.parametrize('cell', ['tetrahedron', 'triangle'])
+# XDMF's name for each, and meshio's
+QUADRATIC_TOPOLOGY = {'tetrahedron': 'Tetrahedron_10', 'triangle': 'Triangle_6'}
+MESHIO_QUADRATIC = {'tetrahedron': 'tetra10', 'triangle': 'triangle6'}
+
+
+def unit_mesh(n=2, cell='tetrahedron'):
+    if cell == 'triangle':
+        return df.UnitSquareMesh(n, n)
     return df.UnitCubeMesh(n, n, n)
+
+
+QUADRATIC_EXPRESSION = {3: 'x[0]*x[0] + 2*x[1]*x[1] - x[2]*x[2]',
+                        2: 'x[0]*x[0] + 2*x[1]*x[1] - 3*x[0]*x[1]'}
+
+
+def quadratic_exact(coords, gdim=3):
+    """`quadratic_field`'s values at the rows of `coords`, as the file holds them."""
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    if gdim == 2:
+        return x * x + 2 * y * y - 3 * x * y
+    return x * x + 2 * y * y - z * z
 
 
 def quadratic_field(mesh, name='u'):
@@ -57,16 +78,19 @@ def quadratic_field(mesh, name='u'):
     V = df.FunctionSpace(mesh, 'CG', 2)
     u = df.Function(V)
     u.rename(name, name)
-    u.interpolate(df.Expression('x[0]*x[0] + 2*x[1]*x[1] - x[2]*x[2]', degree=2))
+    u.interpolate(df.Expression(QUADRATIC_EXPRESSION[mesh.geometry().dim()],
+                                degree=2))
     return u
 
 
 def vector_field(mesh, degree=2, name='u'):
+    """A vector whose first component is x[0]**2 in 2D and in 3D."""
     V = df.VectorFunctionSpace(mesh, 'CG', degree)
     u = df.Function(V)
     u.rename(name, name)
-    u.interpolate(df.Expression(('x[0]*x[0]', 'x[1]*x[2]', 'x[2]*x[2]'),
-                                degree=degree))
+    components = (('x[0]*x[0]', 'x[1]*x[2]', 'x[2]*x[2]')
+                  if mesh.geometry().dim() == 3 else ('x[0]*x[0]', 'x[0]*x[1]'))
+    u.interpolate(df.Expression(components, degree=degree))
     return u
 
 
@@ -80,26 +104,32 @@ def assert_close(a, b, tol, what):
 
 # -- the quadratic half: what dolfin gets wrong ----------------------------------
 
-def test_quadratic_survives():
+@CELLS
+def test_quadratic_survives(cell):
     """a P2 field keeps its midside nodes"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     u = quadratic_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('q.xdmf')) as f:
         f.write(u)
     grids = _scan(tmp('q.xdmf'))
     assert len(grids) == 1, grids
-    assert grids[0]['topology'] == 'Tetrahedron_10', grids[0]['topology']
+    assert grids[0]['topology'] == QUADRATIC_TOPOLOGY[cell], grids[0]['topology']
     coords, conn = _read_grid_geometry(tmp('q.xdmf'), grids[0])
     values = _read_grid_attribute(tmp('q.xdmf'), grids[0], 'u').ravel()
-    assert conn.shape[1] == 10, conn.shape
+    corners, edges, _ = QUADRATIC[cell]
+    assert conn.shape[1] == corners + len(edges), conn.shape
+    # three coordinates, a 2D mesh's with z = 0
+    assert coords.shape[1] == 3, coords.shape
+    if cell == 'triangle':
+        assert not coords[:, 2].any(), 'a 2D mesh has nodes off its plane'
 
     # the field really is quadratic: midsides depart from the corner mean
-    gap = max(abs(values[c[4 + k]] - 0.5 * (values[c[i]] + values[c[j]]))
-              for c in conn for k, (i, j) in enumerate(XDMF_EDGES))
+    gap = max(abs(values[c[corners + k]] - 0.5 * (values[c[i]] + values[c[j]]))
+              for c in conn for k, (i, j) in enumerate(edges))
     assert gap > 1e-3, 'the test field is not quadratic enough to prove anything'
 
     # and every node's value is the exact analytic one
-    exact = coords[:, 0] ** 2 + 2 * coords[:, 1] ** 2 - coords[:, 2] ** 2
+    exact = quadratic_exact(coords, mesh.geometry().dim())
     assert_close(values, exact, 1e-12, 'nodal values')
     print('midsides depart from the corner mean by {:.3f}'.format(gap))
 
@@ -125,25 +155,70 @@ The difference is measured, not asserted from the documentation."""
     print('dolfin {} nodes, this {}'.format(n_dolfin, len(ours)))
 
 
-def test_node_order():
+@CELLS
+def test_node_order(cell):
     """the node order is XDMF's, not dolfin's"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     u = quadratic_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('order.xdmf')) as f:
         f.write(u)
     coords, conn = _read_grid_geometry(tmp('order.xdmf'), _scan(tmp('order.xdmf'))[0])
-    for k, (a, b) in enumerate(XDMF_EDGES):
-        mid = coords[conn[:, 4 + k]]
+    corners, edges, order = QUADRATIC[cell]
+    for k, (a, b) in enumerate(edges):
+        mid = coords[conn[:, corners + k]]
         want = 0.5 * (coords[conn[:, a]] + coords[conn[:, b]])
-        assert_close(mid, want, 1e-12, 'midside slot {}'.format(4 + k))
+        assert_close(mid, want, 1e-12, 'midside slot {}'.format(corners + k))
     # and the two conventions really do differ, so the permutation is not a no-op
-    assert XDMF_ORDER != list(range(10)), 'the permutation is the identity'
-    print('all six midsides sit on their edges; permutation {}'.format(XDMF_ORDER))
+    assert order != list(range(len(order))), 'the permutation is the identity'
+    print('all {} midsides sit on their edges; permutation {}'.format(len(edges), order))
 
 
-def test_several_fields():
+def test_node_conventions():
+    """both node orders are the ones their owners use
+
+XDMF's stated from its own documentation, dolfin's measured.
+
+    `test_node_order` checks the file against the edge lists in the module, so a
+    wrong list would pass it. Here XDMF's lists are spelled out independently --
+    Triangle_6 is three corners then (0,1), (1,2), (2,0); Tetrahedron_10 is four
+    corners then (0,1), (1,2), (2,0), (0,3), (1,3), (2,3), as in VTK -- and dolfin's
+    are read off where the writer takes them from: the P2 dof coordinates of a cell,
+    and the mesh's cell-to-edge connectivity, which must agree with each other.
+    """
+    stated = {'triangle': [(0, 1), (1, 2), (2, 0)],
+              'tetrahedron': [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]}
+    for cell, xdmf_edges in stated.items():
+        corners, edges, order = QUADRATIC[cell]
+        assert [tuple(sorted(e)) for e in xdmf_edges] == list(edges), (cell, edges)
+        mesh = unit_mesh(2, cell)
+        tdim = mesh.topology().dim()
+        mesh.init(tdim, 1)
+        mesh.init(1, 0)
+        V = df.FunctionSpace(mesh, 'CG', 2)
+        x = V.tabulate_dof_coordinates()
+        vertices = mesh.coordinates()
+        for c in df.cells(mesh):
+            v = c.entities(0)
+            dofs = x[V.dofmap().cell_dofs(c.index())]
+            # dolfin's dofs, reordered into XDMF's slots, are corners then midsides
+            # of exactly the stated edges
+            ours = dofs[order]
+            assert_close(ours[:corners], vertices[v], 1e-14, 'corners')
+            for k, (a, b) in enumerate(xdmf_edges):
+                assert_close(ours[corners + k], 0.5 * (vertices[v[a]] + vertices[v[b]]),
+                             1e-14, '{} slot {}'.format(cell, corners + k))
+            # and the mesh's local edge i is the one holding dolfin's dof corners + i
+            for i, e in enumerate(c.entities(1)):
+                ends = vertices[df.Edge(mesh, e).entities(0)]
+                assert_close(dofs[corners + i], ends.mean(axis=0), 1e-14,
+                             '{} local edge {}'.format(cell, i))
+    print('Triangle_6 and Tetrahedron_10 slots match dolfin\'s dofs and edges')
+
+
+@CELLS
+def test_several_fields(cell):
     """several fields share one node set"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     u = vector_field(mesh)
     p = df.Function(df.FunctionSpace(mesh, 'CG', 1))
     p.rename('p', 'p')
@@ -154,12 +229,17 @@ def test_several_fields():
     assert len(grids) == 1, 'both fields must share one grid, got {}'.format(len(grids))
     assert set(grids[0]['attributes']) == {'u', 'p'}, grids[0]['attributes']
     coords, conn = _read_grid_geometry(tmp('up.xdmf'), grids[0])
-    assert conn.shape[1] == 10, 'the P1 pressure must be carried onto P2 nodes'
+    assert conn.shape[1] == {'tetrahedron': 10, 'triangle': 6}[cell], \
+        'the P1 pressure must be carried onto P2 nodes'
     pv = _read_grid_attribute(tmp('up.xdmf'), grids[0], 'p').ravel()
     assert_close(pv, coords[:, 0] + coords[:, 1], 1e-12, 'pressure on P2 nodes')
     uv = _read_grid_attribute(tmp('up.xdmf'), grids[0], 'u')
+    # a 2D vector is padded to XDMF's three components, as dolfin pads it
     assert uv.shape[1] == 3, uv.shape
     assert_close(uv[:, 0], coords[:, 0] ** 2, 1e-12, 'u0')
+    if cell == 'triangle':
+        assert_close(uv[:, 1], coords[:, 0] * coords[:, 1], 1e-12, 'u1')
+        assert not uv[:, 2].any(), 'the padding component is not zero'
     print('u and p on {} shared nodes'.format(len(coords)))
 
 
@@ -424,9 +504,10 @@ A MeshFunction over the wrong entities would be plausible and wrong.
 
 # -- time series ------------------------------------------------------------------
 
-def test_time_series():
+@CELLS
+def test_time_series(cell):
     """a time series holds every step"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     V = df.FunctionSpace(mesh, 'CG', 2)
     u = df.Function(V)
     u.rename('u', 'u')
@@ -453,9 +534,10 @@ def test_time_series():
     print('{} steps in one temporal collection, each exact'.format(len(times)))
 
 
-def test_rewrite_function_mesh():
+@CELLS
+def test_rewrite_function_mesh(cell):
     """rewrite_function_mesh stores the mesh once or per step"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     u = quadratic_field(mesh)
     sizes = {}
     for flag in (False, True):
@@ -476,9 +558,10 @@ def test_rewrite_function_mesh():
     print('shared {} B, rewritten {} B'.format(sizes[False], sizes[True]))
 
 
-def test_functions_share_mesh():
+@CELLS
+def test_functions_share_mesh(cell):
     """functions_share_mesh puts the next field on the same grid"""
-    mesh = unit_mesh()
+    mesh = unit_mesh(cell=cell)
     u = quadratic_field(mesh, 'u')
     v = quadratic_field(mesh, 'v')
     for flag, expect in ((True, 1), (False, 2)):
@@ -494,11 +577,124 @@ def test_functions_share_mesh():
     print('shared -> 1 grid, separate -> 2')
 
 
+def periodic_x():
+    """x[0] = 1 mapped onto x[0] = 0, in any dimension."""
+    class Periodic(df.SubDomain):
+        def inside(self, x, on_boundary):
+            return bool(df.near(x[0], 0.0) and on_boundary)
+
+        def map(self, x, y):
+            y[0] = x[0] - 1.0
+            for i in range(1, len(x)):
+                y[i] = x[i]
+    return Periodic()
+
+
+# periodic in x[0], and quadratic in nothing: the P2 nodes hold it exactly only as
+# point values, which is what is compared
+PERIODIC_VELOCITY = ('cos(2*pi*x[0])*x[1] + t', 'sin(2*pi*x[0])*x[1]*x[1]')
+
+
+def test_periodic_series_on_triangles():
+    """a periodic 2D velocity, written step by step, is the whole mesh's nodes
+
+The way twoasis writes its series, and the way it reads them back.
+
+    One file per field, `rewrite_function_mesh` off and `flush_output` on, one
+    `write(f, t)` a step. twoasis reads them by parsing the XDMF (`xdmf.grids`) and
+    matching its own dof coordinates to the stored nodes, so the geometry must be
+    every vertex and every edge midpoint of the whole mesh -- both sides of the
+    period, which the periodic space identifies -- and every value the field's own
+    value at its node.
+    """
+    import h5py
+    from scipy.spatial import cKDTree
+    from femtools.xdmf import grids as xdmf_grids
+    mesh = unit_mesh(4, 'triangle')
+    V = df.VectorFunctionSpace(mesh, 'CG', 2, constrained_domain=periodic_x())
+    P = df.FunctionSpace(mesh, 'CG', 1, constrained_domain=periodic_x())
+    assert V.dim() < df.VectorFunctionSpace(mesh, 'CG', 2).dim(), 'not periodic'
+    u, p = df.Function(V), df.Function(P)
+    u.rename('u', 'u')
+    p.rename('p', 'p')
+    files = {name: XDMFFile2(df.MPI.comm_world, tmp('tri_{}.xdmf'.format(name)))
+             for name in 'up'}
+    for f in files.values():
+        f.parameters['rewrite_function_mesh'] = False
+        f.parameters['flush_output'] = True
+    times, saved = [0.0, 0.25, 0.5], []
+    for t in times:
+        u.interpolate(df.Expression(PERIODIC_VELOCITY, t=t, degree=4))
+        p.interpolate(df.Expression('t*cos(2*pi*x[0]) + x[1]', t=t, degree=2))
+        files['u'].write(u, t)
+        files['p'].write(p, t)
+        saved.append(u.vector().get_local().copy())
+        # flushed as it goes: the XML names every step so far, before any close
+        assert len(xdmf_grids(tmp('tri_u.xdmf'))) == len(saved)
+    for f in files.values():
+        f.close()
+
+    steps = xdmf_grids(tmp('tri_u.xdmf'))
+    assert [g['time'] for g in steps] == times, [g['time'] for g in steps]
+    assert len({g['geometry'] for g in steps}) == 1, 'the mesh was stored per step'
+    assert _scan(tmp('tri_u.xdmf'))[0]['topology'] == 'Triangle_6'
+    assert _scan(tmp('tri_p.xdmf'))[0]['topology'] == 'Triangle'
+    with h5py.File(steps[0]['geometry'][0], 'r') as h:
+        nodes = h[steps[0]['geometry'][1]][:]
+    assert nodes.shape == (mesh.num_vertices() + mesh.num_edges(), 3), nodes.shape
+    assert not nodes[:, 2].any(), 'a 2D mesh has nodes off its plane'
+    mesh.init(1, 0)
+    want = np.vstack((mesh.coordinates(),
+                      [e.midpoint().array()[:2] for e in df.edges(mesh)]))
+    for a, b, what in ((nodes[:, :2], want, 'a node is no vertex or midpoint'),
+                       (want, nodes[:, :2], 'a vertex or midpoint is missing')):
+        distance, _ = cKDTree(a).query(b)
+        assert distance.max() < 1e-14, what
+
+    tree = cKDTree(nodes[:, :2])
+    x = V.tabulate_dof_coordinates()
+    for g, t, ref in zip(steps, times, saved):
+        with h5py.File(g['attributes']['u'][0], 'r') as h:
+            values = h[g['attributes']['u'][1]][:]
+        assert values.shape == (len(nodes), 3), values.shape
+        # the field's value at every node, either side of the period
+        assert_close(values[:, 0], np.cos(2 * np.pi * nodes[:, 0]) * nodes[:, 1] + t,
+                     1e-14, 'u0 at the nodes, t={}'.format(t))
+        assert_close(values[:, 1], np.sin(2 * np.pi * nodes[:, 0]) * nodes[:, 1] ** 2,
+                     1e-14, 'u1 at the nodes, t={}'.format(t))
+        assert not values[:, 2].any(), 'the padding component is not zero'
+        # and twoasis's read: each component's dofs matched to the nodes
+        back = np.empty_like(ref)
+        for c in range(2):
+            dofs = np.asarray(V.sub(c).dofmap().dofs())
+            _, index = tree.query(x[dofs])
+            back[dofs] = values[index, c]
+        assert_close(back, ref, 1e-14, 'matched read at t={}'.format(t))
+    for g, t in zip(xdmf_grids(tmp('tri_p.xdmf')), times):
+        with h5py.File(g['geometry'][0], 'r') as h:
+            px = h[g['geometry'][1]][:]
+        with h5py.File(g['attributes']['p'][0], 'r') as h:
+            pv = h[g['attributes']['p'][1]][:].ravel()
+        assert len(px) == mesh.num_vertices(), len(px)
+        assert_close(pv, t * np.cos(2 * np.pi * px[:, 0]) + px[:, 1], 1e-14,
+                     'p at t={}'.format(t))
+
+    # read_checkpoint takes the last step by default, any other by counter
+    for counter, ref in ((-1, saved[-1]), (0, saved[0])):
+        back = df.Function(V)
+        with XDMFFile2(df.MPI.comm_world, tmp('tri_u.xdmf')) as f:
+            f.read_checkpoint(back, 'u', counter)
+        assert_close(back.vector().get_local(), ref, 1e-14,
+                     'read_checkpoint step {}'.format(counter))
+    print('{} steps of {} nodes, one mesh, exact both ways'.format(len(times), len(nodes)))
+
+
 # -- reading back -----------------------------------------------------------------
 
-def test_read_quadratic_back():
+@CELLS
+def test_read_quadratic_back(cell):
     """a quadratic grid reads back into a P2 Function"""
-    mesh = unit_mesh(3)
+    mesh = unit_mesh(3, cell)
     u = quadratic_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('rt.xdmf')) as f:
         f.write(u)
@@ -514,13 +710,15 @@ def test_read_quadratic_back():
             f.read_checkpoint(back, 'u', 0)
     except Exception:
         failed = True
-    assert failed, 'dolfin read a Tetrahedron_10 file, so this path is unnecessary'
+    assert failed, 'dolfin read a {} file, so this path is unnecessary'.format(
+        QUADRATIC_TOPOLOGY[cell])
     print('exact round trip; dolfin refuses the same file')
 
 
-def test_read_vector_back():
+@CELLS
+def test_read_vector_back(cell):
     """a quadratic vector reads back"""
-    mesh = unit_mesh(2)
+    mesh = unit_mesh(2, cell)
     u = vector_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('rtv.xdmf')) as f:
         f.write(u)
@@ -529,10 +727,11 @@ def test_read_vector_back():
         f.read_checkpoint(back, 'u', 0)
     assert_close(back.vector().get_local(), u.vector().get_local(), 1e-12,
                  'P2 vector round trip')
-    print('three components, exact')
+    print('{} components, exact'.format(mesh.geometry().dim()))
 
 
-def test_read_into_periodic():
+@CELLS
+def test_read_into_periodic(cell):
     """a periodic space reads back, where coordinate matching does not
 
     DESIGN-NOTES.md, "Reading the flow back", records two failed attempts at matching
@@ -547,10 +746,10 @@ def test_read_into_periodic():
 
         def map(self, x, y):
             y[0] = x[0] - 1.0
-            y[1] = x[1]
-            y[2] = x[2]
+            for i in range(1, len(x)):
+                y[i] = x[i]
 
-    mesh = unit_mesh(2)
+    mesh = unit_mesh(2, cell)
     V = df.FunctionSpace(mesh, 'CG', 2, constrained_domain=Periodic())
     u = df.Function(V)
     u.rename('u', 'u')
@@ -645,26 +844,30 @@ def test_checkpoint_conflict():
 
 # -- the XML is really XDMF ---------------------------------------------------------
 
-def test_meshio_reads_it():
+@CELLS
+def test_meshio_reads_it(cell):
     """an independent reader agrees the file is XDMF
 
 meshio knows nothing of dolfin or of this module, so it is the outside check."""
     import meshio
-    mesh = unit_mesh(2)
+    mesh = unit_mesh(2, cell)
+    last = mesh.geometry().dim() - 1
     u = vector_field(mesh)
     p = df.Function(df.FunctionSpace(mesh, 'CG', 1))
     p.rename('p', 'p')
-    p.interpolate(df.Expression('x[2]', degree=1))
+    p.interpolate(df.Expression('x[{}]'.format(last), degree=1))
     with XDMFFile2(df.MPI.comm_world, tmp('mio.xdmf')) as f:
         f.write((u, p))
     got = meshio.read(tmp('mio.xdmf'))
-    assert 'tetra10' in {b.type for b in got.cells}, [b.type for b in got.cells]
+    kind = MESHIO_QUADRATIC[cell]
+    assert kind in {b.type for b in got.cells}, [b.type for b in got.cells]
     assert set(got.point_data) == {'u', 'p'}, set(got.point_data)
-    coords, _ = _read_grid_geometry(tmp('mio.xdmf'), _scan(tmp('mio.xdmf'))[0])
+    coords, conn = _read_grid_geometry(tmp('mio.xdmf'), _scan(tmp('mio.xdmf'))[0])
     assert_close(got.points, coords, 1e-14, 'meshio vs this reader, coordinates')
-    assert_close(got.point_data['p'].ravel(), coords[:, 2], 1e-12,
+    assert np.array_equal(got.get_cells_type(kind), conn), 'meshio reads other cells'
+    assert_close(got.point_data['p'].ravel(), coords[:, last], 1e-12,
                  'meshio reading the pressure')
-    print('{} points, {} tetra10 cells, fields {}'.format(len(got.points), len(got.get_cells_type('tetra10')), ','.join(sorted(got.point_data))))
+    print('{} points, {} {} cells, fields {}'.format(len(got.points), len(got.get_cells_type(kind)), kind, ','.join(sorted(got.point_data))))
 
 
 def test_ascii_refused():
@@ -697,19 +900,21 @@ Support was removed: the arrays always go to HDF5. The string, any casing
 
 # -- the standalone route still works ------------------------------------------------
 
-def test_writer_agreement():
+@CELLS
+def test_writer_agreement(cell):
     """write_quadratic and XDMFFile2 write the same layout"""
     from femtools.xdmf import write_quadratic
-    mesh = unit_mesh(2)
+    mesh = unit_mesh(2, cell)
     u = quadratic_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('cls.xdmf')) as f:
         f.write(u)
     grid = _scan(tmp('cls.xdmf'))[0]
     coords, conn = _read_grid_geometry(tmp('cls.xdmf'), grid)
     values = _read_grid_attribute(tmp('cls.xdmf'), grid, 'u')
-    write_quadratic(tmp('fn.xdmf'), coords, conn, [values.ravel()], ['u'])
+    write_quadratic(tmp('fn.xdmf'), coords, conn, [values.ravel()], ['u'],
+                    cell_type=MESHIO_QUADRATIC[cell])
     other = _scan(tmp('fn.xdmf'))[0]
-    assert other['topology'] == grid['topology'] == 'Tetrahedron_10'
+    assert other['topology'] == grid['topology'] == QUADRATIC_TOPOLOGY[cell]
     c2, k2 = _read_grid_geometry(tmp('fn.xdmf'), other)
     v2 = _read_grid_attribute(tmp('fn.xdmf'), other, 'u')
     assert_close(c2, coords, 0.0, 'coordinates')
@@ -892,11 +1097,12 @@ def test_points():
     print('3 points, bare and with values')
 
 
-def test_routes_identical():
+@CELLS
+def test_routes_identical(cell):
     """the standalone route writes the identical file
 
 Both write vertices-then-edges now, so the two files agree bit for bit."""
-    mesh = unit_mesh(3)
+    mesh = unit_mesh(3, cell)
     u = quadratic_field(mesh)
     with XDMFFile2(df.MPI.comm_world, tmp('ident.xdmf')) as f:
         f.write(u)
@@ -907,6 +1113,11 @@ Both write vertices-then-edges now, so the two files agree bit for bit."""
         len(coords), mesh.num_vertices(), mesh.num_edges())
     assert_close(coords[:mesh.num_vertices()], _pad(mesh.coordinates()), 0.0,
                  'the first nodes are the mesh vertices, in order')
+    # and the rest are the edge midpoints, in edge order
+    mesh.init(1, 0)
+    ends = _pad(mesh.coordinates())[np.array([e.entities(0) for e in df.edges(mesh)])]
+    assert_close(coords[mesh.num_vertices():], ends.mean(axis=1), 1e-15,
+                 'the edge nodes are the edge midpoints, in order')
     print('{} vertices then {} edge nodes'.format(mesh.num_vertices(), mesh.num_edges()))
 
 
@@ -1061,8 +1272,9 @@ def test_p1_on_triangles():
     """a P1 field on a triangle mesh is written, as dolfin writes it
 
 Degree 1 has no midsides and works on any simplex; refusing it was a
-    regression against both dolfin and the older delegating implementation. The
-    quadratic refusal stays: the midside numbering here is the tetrahedron's."""
+    regression against both dolfin and the older delegating implementation. A P2
+    field on the same mesh is a `Triangle_6` grid, and P2 on an interval, which has
+    no midside numbering here, is refused by name."""
     mesh = df.UnitSquareMesh(4, 4)
     u = df.Function(df.FunctionSpace(mesh, 'CG', 1))
     u.rename('u', 'u')
@@ -1074,15 +1286,22 @@ Degree 1 has no midsides and works on any simplex; refusing it was a
     coords, conn = _read_grid_geometry(tmp('tri_p1.xdmf'), g)
     vals = _read_grid_attribute(tmp('tri_p1.xdmf'), g, 'u').ravel()
     assert_close(vals, coords[:, 0] + 2 * coords[:, 1], 1e-12, 'P1 values')
+    assert conn.shape == (mesh.num_cells(), 3), conn.shape
+    assert len(coords) == mesh.num_vertices(), (len(coords), mesh.num_vertices())
     w = df.Function(df.FunctionSpace(mesh, 'CG', 2))
     with XDMFFile2(df.MPI.comm_world, tmp('tri_p2.xdmf')) as f:
+        f.write(w)
+    assert _scan(tmp('tri_p2.xdmf'))[0]['topology'] == 'Triangle_6'
+    line = df.Function(df.FunctionSpace(df.UnitIntervalMesh(4), 'CG', 2))
+    with XDMFFile2(df.MPI.comm_world, tmp('int_p2.xdmf')) as f:
         try:
-            f.write(w)
+            f.write(line)
         except ValueError as exc:
-            assert 'tetrahedra' in str(exc), str(exc)
+            assert 'interval' in str(exc), str(exc)
         else:
-            raise AssertionError('P2 on triangles was accepted')
-    print('{} triangles written; P2 on them still refused'.format(len(conn)))
+            raise AssertionError('P2 on an interval was accepted')
+    print('{} triangles written; P2 on them is Triangle_6, on an interval refused'
+          .format(len(conn)))
 
 
 def test_mvc_value_types():
@@ -1261,6 +1480,103 @@ with XDMFFile2(C, sys.argv[1]) as f:
 if R == 0:
     print('OK dim={{}} vertices={{}}'.format(V.dim(), mesh.num_entities_global(0)))
 """
+
+
+TRIANGLE_SCRIPT = """
+import os, sys
+import numpy as np, dolfin as df
+from femtools.xdmf import XDMFFile2
+df.set_log_level(40)
+C = df.MPI.comm_world
+out = sys.argv[1]
+
+
+class Periodic(df.SubDomain):
+    def inside(self, x, on_boundary):
+        return bool(df.near(x[0], 0.0) and on_boundary)
+
+    def map(self, x, y):
+        y[0] = x[0] - 1.0
+        y[1] = x[1]
+
+
+mesh = df.UnitSquareMesh(C, 8, 8)
+V = df.VectorFunctionSpace(mesh, 'CG', 2, constrained_domain=Periodic())
+P = df.FunctionSpace(mesh, 'CG', 1, constrained_domain=Periodic())
+Q = df.FunctionSpace(mesh, 'CG', 2)
+u = df.Function(V); u.rename('u', 'u')
+p = df.Function(P); p.rename('p', 'p')
+q = df.Function(Q); q.rename('q', 'q')
+# marked geometrically, so every partition marks the same physical cells
+tags = df.MeshFunction('size_t', mesh, 2, 0); tags.rename('t', 't')
+for c in df.cells(mesh):
+    m = c.midpoint()
+    tags[c] = int(round(48*m.x()) + 49*round(48*m.y()))
+# the series the way twoasis writes them: a file per field, the mesh once, flushed
+files = {}
+for name in ('u', 'p'):
+    files[name] = XDMFFile2(C, os.path.join(out, name + '.xdmf'))
+    files[name].parameters['rewrite_function_mesh'] = False
+    files[name].parameters['flush_output'] = True
+for t in (0.0, 0.5, 1.0):
+    u.interpolate(df.Expression(%r, t=t, degree=4))
+    p.interpolate(df.Expression('t*cos(2*pi*x[0]) + x[1]', t=t, degree=2))
+    files['u'].write(u, t)
+    files['p'].write(p, t)
+driver = files['u']._doc.driver
+for f in files.values():
+    f.close()
+q.interpolate(df.Expression(%r, degree=2))
+with XDMFFile2(C, os.path.join(out, 'uq.xdmf')) as f:
+    f.write((u, q, tags))
+# and back, the last step into the periodic space
+back = df.Function(V)
+with XDMFFile2(C, os.path.join(out, 'u.xdmf')) as f:
+    f.read_checkpoint(back, 'u')
+err = df.MPI.max(C, float(np.abs(back.vector().get_local()
+                                 - u.vector().get_local()).max()))
+if df.MPI.rank(C) == 0:
+    print('DRIVER=' + driver)
+    print('ERR=%%.3e' %% err)
+""" % (PERIODIC_VELOCITY, QUADRATIC_EXPRESSION[2])
+
+
+@pytest.mark.mpi
+def test_triangles_rank_counts():
+    """P2 on triangles: one, two and three ranks write the same files
+
+MPI-IO on two and three, the gather on three as well, all against serial.
+
+    A periodic vector series written the way twoasis writes it, and a P2 scalar
+    beside it on one grid with cell data, read back on the same ranks into the
+    periodic space. dolfin numbers the edges after partitioning, so the files are
+    compared by node position (`_content_equal`), not byte for byte.
+    """
+    script = os.path.join(TMP, 'tri_ranks.py')
+    with open(script, 'w') as handle:
+        handle.write(TRIANGLE_SCRIPT)
+    folders = {}
+    for tag, ranks, gather in (('1', 1, False), ('2', 2, False), ('3', 3, False),
+                               ('3g', 3, True)):
+        folder = folders[tag] = tmp('tri_ranks_' + tag)
+        os.makedirs(folder)
+        argv = (['-x', 'H5PY_NEVER_USE_MPI'] if gather else []) + \
+            [sys.executable, script, folder]
+        proc = support.run(argv, ranks, timeout=900,
+                           env={'H5PY_NEVER_USE_MPI': '1'} if gather else None)
+        said = dict(line.split('=', 1) for line in proc.stdout.splitlines()
+                    if line.startswith(('DRIVER=', 'ERR=')))
+        assert said.get('DRIVER') == ('mpio' if ranks > 1 and not gather
+                                      else 'serial'), (tag, said)
+        assert float(said['ERR']) < 1e-12, (tag, said)
+    for name, topology in (('u', 'Triangle_6'), ('p', 'Triangle'), ('uq', 'Triangle_6')):
+        serial = os.path.join(folders['1'], name + '.xdmf')
+        assert {g['topology'] for g in _scan(serial)} == {topology}, name
+        for tag in ('2', '3', '3g'):
+            _content_equal(os.path.join(folders[tag], name + '.xdmf'), serial)
+    assert _scan(os.path.join(folders['1'], 'uq.xdmf'))[0]['centers'] == \
+        {'u': 'Node', 'q': 'Node', 't': 'Cell'}
+    print('serial, 2 and 3 ranks (mpio) and 3 (gather) agree; read back exact')
 
 
 @pytest.mark.mpi
