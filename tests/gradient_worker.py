@@ -1,7 +1,8 @@
 """WGM * p for a quadratic p on P1 over a UnitCubeMesh, written by rank zero as
-`(dof coordinates, d/dx, d/dy, d/dz)` rows to argv[1]; any rank count.
+`(dof coordinates, d/dx, d/dy, d/dz)` rows to argv[1]; any rank count, in dolfin's
+`ghost_mode` argv[2] (default none).
 
-    mpirun -n 2 python3 tests/gradient_worker.py OUT.npy
+    mpirun -n 2 python3 tests/gradient_worker.py OUT.npy [shared_facet]
 """
 import sys
 
@@ -11,6 +12,7 @@ from mpi4py import MPI
 
 from femtools.gradient import compute_weighted_gradient_matrix
 
+df.parameters["ghost_mode"] = sys.argv[2] if len(sys.argv) > 2 else "none"
 mesh = df.UnitCubeMesh(4, 4, 4)
 Q = df.FunctionSpace(mesh, "CG", 1)
 DG = df.FunctionSpace(mesh, "DG", 0)

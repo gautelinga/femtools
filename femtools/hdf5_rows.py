@@ -22,6 +22,7 @@ than the fancy selection it replaces as well as in memory.
 **mpi4py is imported lazily**, only on the parallel path, so a serial caller needs numpy
 and h5py alone. With no comm, or on one rank, this is a plain read and nothing is imported.
 """
+import contextlib
 import os
 
 import numpy as np
@@ -68,16 +69,18 @@ def round_slices(counts, r, rounds):
 
 
 def _agreed_layout(comm, a, n):
-    """The dtype and row shape every rank with rows passed for an array; a rank with
-    none may pass any (an empty default). Disagreeing ranks are refused on every rank:
+    """The dtype and row shape every rank with rows passed for an array (rank zero's
+    when none has rows); a rank with none may pass any (an empty default). Disagreeing
+    ranks are refused on every rank:
     received into its own dtype, a row would be another's bytes reinterpreted."""
     mine = (a.dtype.str, tuple(a.shape[1:])) if n else None
     seen = {t for t in comm.allgather(mine) if t is not None}
     if len(seen) > 1:
         raise ValueError("ranks pass rows of different dtypes or shapes: {}".format(
             sorted(seen)))
-    if not seen:
-        return a.dtype, tuple(a.shape[1:])
+    if not seen:        # no rank has rows: rank zero's, so that all still agree
+        dt, shape = comm.bcast((a.dtype.str, tuple(a.shape[1:])), root=0)
+        return np.dtype(dt), shape
     dt, shape = seen.pop()
     return np.dtype(dt), shape
 
@@ -420,6 +423,63 @@ def lookup(comm, edges, block, wanted):
     return out.reshape((len(wanted),) + block.shape[1:])
 
 
+def unique_rows(rows):
+    """`np.unique(rows, axis=0)` for int rows, the same rows in the same order, many times
+    faster than numpy's sort of the rows as one structured value each (the periodic
+    repair's largest cost): the columns packed, each from its minimum, into one int64 that sorts in
+    the rows' order when their ranges fit 63 bits (vertex numbers, ranks and the kind do),
+    else a lexsort and a neighbour comparison."""
+    if not len(rows):
+        return rows.reshape(0, rows.shape[1])
+    lo = rows.min(axis=0)
+    bits = [int(w).bit_length() for w in rows.max(axis=0) - lo]
+    if sum(bits) <= 63:
+        key = np.zeros(len(rows), np.int64)
+        for c, b in enumerate(bits):
+            key = (key << b) | (rows[:, c] - lo[c])
+        key = np.unique(key)
+        out = np.empty((len(key), rows.shape[1]), rows.dtype)
+        for c in range(rows.shape[1] - 1, -1, -1):
+            out[:, c] = (key & ((1 << bits[c]) - 1)) + lo[c]
+            key = key >> bits[c]
+        return out
+    s = rows[np.lexsort(rows.T[::-1])]
+    return s[np.r_[True, np.any(s[1:] != s[:-1], axis=1)]]
+
+
+def find_rows(a, b):
+    """For each row of `a`, the index of the equal row of `b` (unique rows), or -1."""
+    if not len(a) or not len(b):
+        return np.full(len(a), -1, np.int64)
+    both = np.concatenate([b, a])
+    order = np.lexsort(both.T[::-1])
+    s = both[order]
+    first = np.r_[True, np.any(s[1:] != s[:-1], axis=1)]
+    group = np.cumsum(first) - 1
+    head = np.full(group[-1] + 1, -1, np.int64)
+    from_b = order < len(b)
+    head[group[from_b]] = order[from_b]
+    out = np.empty(len(both), np.int64)
+    out[order] = head[group]
+    return out[len(b):]
+
+
+def extent(x, comm=None, width=None):
+    """`(lower, upper)`: the corners of the bounding box of every rank's rows `x` of
+    coordinates, `width` components each (a rank may hold none). Collective."""
+    x = np.asarray(x, float)
+    width = x.shape[1] if width is None else int(width)
+    lo = x.min(axis=0) if len(x) else np.full(width, np.inf)
+    hi = x.max(axis=0) if len(x) else np.full(width, -np.inf)
+    if comm is None or comm.Get_size() == 1:
+        return lo, hi
+    from mpi4py import MPI
+    out_lo, out_hi = np.empty(width), np.empty(width)
+    comm.Allreduce(np.ascontiguousarray(lo), out_lo, op=MPI.MIN)
+    comm.Allreduce(np.ascontiguousarray(hi), out_hi, op=MPI.MAX)
+    return out_lo, out_hi
+
+
 def unique_inverse(values):
     """`np.unique(values, return_inverse=True)`, the same two arrays, for the 1-D int64
     arrays of row and vertex ids the readers deduplicate: value and position packed into
@@ -624,29 +684,116 @@ def flag_first(comm, gid, flag, n):
     return lookup(comm, edges, block, gid), total
 
 
+def mpio(comm):
+    """Whether a write on `comm` goes through MPI-IO: more than one rank, and h5py's MPI
+    build loaded (Debian's h5py loads it when `OMPI_COMM_WORLD_SIZE` or `MPI_LOCALNRANKS`
+    is set, unless `H5PY_NEVER_USE_MPI` is; `H5PY_ALWAYS_USE_MPI` forces it)."""
+    if comm is None or comm.Get_size() == 1:
+        return False
+    import h5py
+    return bool(h5py.get_config().mpi)
+
+
+@contextlib.contextmanager
+def opened(path, mode, comm=None):
+    """`path` opened for what every rank writes alike (groups, attributes, links): by
+    every rank, collectively, under MPI-IO (`mpio`); otherwise by rank zero alone, and
+    None on the others. Collective."""
+    import h5py
+    rank = 0 if comm is None else comm.Get_rank()
+    if mpio(comm):
+        with h5py.File(path, mode, driver="mpio", comm=comm) as h5:
+            yield h5    # closed collectively: no rank goes on before it is written
+        return
+    if rank == 0:
+        with h5py.File(path, mode) as h5:
+            yield h5
+    else:
+        yield None
+    if comm is not None and comm.Get_size() > 1:
+        comm.Barrier()
+
+
+def collective_write(node, lo, values):
+    """One rank's part of a collective dataset write, rows lo.. of `node`, empty parts
+    included.
+
+    Every rank must take part in a collective write -- but h5py's `__setitem__`
+    returns without calling H5Dwrite when the selection is empty, so a rank with
+    nothing to write silently skips the collective the other ranks are inside.
+    Rank zero then spins in `H5D__write`'s Allreduce while the rest wait in the
+    file-close barrier, all at full CPU, forever. The empty rank instead makes the
+    low-level write with a none-selection, which participates in the collective and
+    writes nothing.
+    """
+    if len(values):
+        with node.collective:
+            node[lo:lo + len(values)] = values
+        return
+    import h5py
+    fspace = node.id.get_space()
+    fspace.select_none()
+    mspace = h5py.h5s.create_simple((0,) + tuple(node.shape[1:]))
+    mspace.select_none()
+    dxpl = h5py.h5p.create(h5py.h5p.DATASET_XFER)
+    dxpl.set_dxpl_mpio(h5py.h5fd.MPIO_COLLECTIVE)
+    node.id.write(mspace, fspace, np.zeros((0,) + tuple(node.shape[1:]), dtype=node.dtype),
+                  dxpl=dxpl)
+
+
 def write_ordered(path, name, rows, values, n, comm=None, mode="a", attrs=None):
     """Dataset `name` of `path`: row `rows[i]` is `values[i]`, compressed (`compress`).
     Rows may come from several ranks, and the same row more than once (a vertex every
     rank holding it writes); the copies must agree to the bit, and every row 0..n-1 must
-    be given. Under MPI the rows go to blocks of whole chunks (one exchange), each rank
-    compresses its own, and rank zero writes the stored bytes a rank at a time, in
-    messages of at most `MESSAGE` bytes (MPI counts are 32-bit), so no rank ever holds the
-    dataset. Rows that are already one contiguous run a rank, in rank order, covering
-    0..n-1 (a mesh's topology, a vector's local range) go to the blocks as they are, with
-    no index sent and nothing sorted (`_runs`). Collective; rank zero opens the file in
-    `mode`."""
-    import h5py
+    be given. A rank with no rows may pass any empty array: the dtype and row shape are
+    those of the ranks with rows (`_agreed_layout`). Under MPI the rows go to blocks of
+    whole chunks (one exchange), and every rank writes its own block: collectively
+    through MPI-IO (`mpio`), with HDF5 compressing each rank's chunks. Rows that are
+    already one contiguous run a rank, in rank order, covering 0..n-1 (a mesh's topology,
+    a vector's local range) go to the blocks as they are, with no index sent and nothing
+    sorted (`_runs`).
+
+    Without h5py's MPI build each rank compresses its own chunks (`compress.encode`)
+    and rank zero writes the stored bytes a rank at a time, in messages of at most
+    `MESSAGE` bytes (MPI counts are 32-bit), so no rank ever holds the dataset.
+    Collective; the file is opened in `mode` (`opened`), after the rows are checked. A
+    failure while writing aborts the job (`abort.aborting`): the other ranks would wait
+    for the failed one."""
+    from femtools.abort import aborting
+    blocks = _blocks(path, name, rows, values, n, comm)
+    # the abort inside the file: an MPI-IO file's close is collective, and a rank
+    # raising through it would wait there for ranks waiting in the write
+    with opened(path, mode, comm) as h5, aborting(comm):
+        _store(h5, name, blocks, comm, attrs)
+
+
+def write_rows(h5, name, rows, values, n, comm=None, attrs=None):
+    """`write_ordered` into a file already open: `h5` opened by every rank under MPI-IO,
+    by rank zero alone otherwise (None on the others), as `opened` gives it -- a writer
+    that keeps its file open across many datasets (a time series). Collective."""
+    from femtools.abort import aborting
+    blocks = _blocks(getattr(h5, "filename", ""), name, rows, values, n, comm)
+    with aborting(comm):
+        _store(h5, name, blocks, comm, attrs)
+
+
+def _blocks(path, name, rows, values, n, comm):
+    """The rows moved to the ranks writing them: `(n, shape, dtype, lo, block, step)`,
+    this rank's block of whole chunks (`step` rows each) from row `lo`. Refuses, on every
+    rank, rows missing or two copies that differ. Collective."""
     from femtools import compress
     rows = np.asarray(rows, dtype=np.int64)
     values = np.asarray(values)
-    shape = values.shape[1:]
     size = 1 if comm is None else comm.Get_size()
     rank = 0 if comm is None else comm.Get_rank()
-    opts = compress.options((n,) + shape)
+    if size > 1:
+        dt, shape = _agreed_layout(comm, values, len(rows))
+        values = values.astype(dt, copy=False).reshape((len(rows),) + shape)
+    shape = values.shape[1:]
+    step = compress.chunk_rows((n,) + shape) if n else 1
     if size == 1:
         lo, block, bad = 0, *_place(rows, values, 0, n)
     else:
-        step = compress.chunk_rows((n,) + shape) if n else 1
         edges = compress.aligned_edges(n, size, step)
         lo = int(edges[rank])
         runs = _runs(comm, rows, n)
@@ -655,49 +802,57 @@ def write_ordered(path, name, rows, values, n, comm=None, mode="a", attrs=None):
             counts = np.clip(np.minimum(first + len(rows), edges[1:])
                              - np.maximum(first, edges[:-1]), 0, None)
             _, (block,) = exchange(comm, counts, values)
-            values, bad = block[:0], False       # the dtype the ranks agreed on
+            bad = False
         else:
             got, got_values = to_owners(comm, edges, rows, values)
-            values = got_values[:0]
             block, bad = _place(got, got_values, lo, int(edges[rank + 1]))
             got = got_values = None
     if agreed(comm, bad):
         raise ValueError("{}:{}: rows missing, or two copies of a row that differ".format(
             path, name))
-    if size > 1:
-        stored = compress.encode(block, step) if opts else []
-        block = None
-    if rank != 0:
+    return n, shape, values.dtype, lo, block, step
+
+
+def _store(h5, name, blocks, comm, attrs):
+    """`_blocks`' blocks into dataset `name` of `h5` (as `write_rows` takes it)."""
+    from femtools import compress
+    n, shape, dtype, lo, block, step = blocks
+    size = 1 if comm is None else comm.Get_size()
+    opts = compress.options((n,) + shape)
+
+    def create():
+        d = h5.create_dataset(name, shape=(n,) + shape, dtype=dtype, **opts)
+        for k, v in (attrs or {}).items():
+            d.attrs[k] = v
+        return d
+
+    if mpio(comm):
+        d = create()
+        if n:               # a zero-size dataset has no storage to write to
+            collective_write(d, lo, block)
+        return
+    if size == 1:
+        d = create()
+        if n:
+            d[...] = block
+        return
+    stored = compress.encode(block, step) if opts else []
+    block = None
+    if comm.Get_rank() != 0:
         lengths = [len(b) for b in stored]
         comm.send((lo, lengths), dest=0, tag=81)
         for i, j in _batches(lengths):
             comm.Send(np.frombuffer(b"".join(stored[i:j]), np.uint8), dest=0, tag=82)
-        comm.Barrier()
         return
-    try:
-        with h5py.File(path, mode) as h5:
-            d = h5.create_dataset(name, shape=(n,) + shape, dtype=values.dtype, **opts)
-            for k, v in (attrs or {}).items():
-                d.attrs[k] = v
-            if size == 1:
-                if n:
-                    d[...] = block
-            else:
-                put(d, lo, stored, step)
-                for r in range(1, size):
-                    at, lengths = comm.recv(source=r, tag=81)
-                    for i, j in _batches(lengths):
-                        buf = np.empty(sum(lengths[i:j]), np.uint8)
-                        comm.Recv(buf, source=r, tag=82)
-                        ends = np.cumsum(lengths[i:j])
-                        put(d, at + i * step,
-                            [buf[e - m:e] for e, m in zip(ends, lengths[i:j])], step)
-    except BaseException:
-        if size > 1:
-            comm.Abort(1)
-        raise
-    if size > 1:
-        comm.Barrier()
+    d = create()
+    put(d, lo, stored, step)
+    for r in range(1, size):
+        at, lengths = comm.recv(source=r, tag=81)
+        for i, j in _batches(lengths):
+            buf = np.empty(sum(lengths[i:j]), np.uint8)
+            comm.Recv(buf, source=r, tag=82)
+            ends = np.cumsum(lengths[i:j])
+            put(d, at + i * step, [buf[e - m:e] for e, m in zip(ends, lengths[i:j])], step)
 
 
 #: the most bytes one message carries: MPI-3 counts are 32-bit, and an incompressible

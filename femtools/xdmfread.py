@@ -11,9 +11,9 @@ another on one thread; at billions of tetrahedra that takes hours. Here the chun
 raw and inflated on a thread pool (zlib releases the GIL), and the connectivity can be
 walked a chunk-row at a time, the next row being read while the current one is used.
 
-Only the layout meshio and mesh-sphere-packing write is taken this way: rows chunked, one
-column a chunk, gzip and nothing else. Any other dataset is read by h5py as before, so the
-answers never depend on which path was taken.
+The layouts meshio, mesh-sphere-packing and femtools write are taken this way: chunked, one
+or two dimensions, gzip alone or shuffle then gzip (`femtools.compress`). Any other
+dataset is read by h5py as before, so the answers never depend on which path was taken.
 """
 import os
 import zlib
@@ -34,44 +34,63 @@ def items(xdmf):
     return out
 
 
+def _filters(dset):
+    """The filter ids of `dset`'s pipeline, in order."""
+    plist = dset.id.get_create_plist()
+    return [plist.get_filter(i)[0] for i in range(plist.get_nfilters())]
+
+
 def _raw_ok(dset):
-    """Whether `dset` is in the layout read chunk by chunk here."""
-    if dset.chunks is None or dset.compression != 'gzip' or dset.shuffle:
+    """Whether `dset` is in a layout read chunk by chunk here: chunked, gzip alone or
+    shuffle then gzip (`femtools.compress`'s), one or two dimensions."""
+    if dset.chunks is None or dset.ndim not in (1, 2):
         return False
-    if dset.id.get_create_plist().get_nfilters() != 1:
-        return False
-    return dset.ndim == 1 or dset.chunks[1] == 1
+    return _filters(dset) in ([h5py.h5z.FILTER_DEFLATE],
+                              [h5py.h5z.FILTER_SHUFFLE, h5py.h5z.FILTER_DEFLATE])
 
 
-def _inflate(dset, offset, rows):
+def _inflate(dset, offset):
+    """The chunk at `offset`, inflated (and unshuffled) to its full chunk shape: a
+    dataset's last chunks are stored at full size, padded."""
     mask, raw = dset.id.read_direct_chunk(offset)
     if mask:   # a filter skipped for this chunk: h5py would undo it, this cannot
         raise ValueError(f'{dset.name}: chunk {offset} has a filter mask')
-    return np.frombuffer(zlib.decompress(raw), dtype=dset.dtype)[:rows]
+    data = np.frombuffer(zlib.decompress(raw), dtype=np.uint8)
+    size = dset.dtype.itemsize
+    if h5py.h5z.FILTER_SHUFFLE in _filters(dset) and size > 1:
+        # HDF5's shuffle: every value's first byte, then every second, and so on
+        data = np.ascontiguousarray(data.reshape(size, -1).T)
+    return data.view(dset.dtype).reshape(dset.chunks)
+
+
+def _chunk_into(dset, out, r, c):
+    """The chunk at row r (column c) of `dset` into `out` (the dataset's shape, or its
+    rows from r on), trimmed to the dataset."""
+    n = dset.shape[0]
+    chunk = _inflate(dset, (r,) if dset.ndim == 1 else (r, c))
+    k = min(dset.chunks[0], n - r)
+    if dset.ndim == 1:
+        out[:k] = chunk[:k]
+    else:
+        w = min(dset.chunks[1], dset.shape[1] - c)
+        out[:k, c:c + w] = chunk[:k, :w]
 
 
 def read(dset, pool):
     """The whole dataset, its chunks inflated on `pool`."""
     if not _raw_ok(dset):
         return dset[()]
-    n = dset.shape[0]
-    cols = 1 if dset.ndim == 1 else dset.shape[1]
     out = np.empty(dset.shape, dtype=dset.dtype)
-    flat = out.reshape(n, cols)
-    step = dset.chunks[0]
-
-    def one(job):
-        r, c = job
-        k = min(step, n - r)
-        flat[r:r + k, c] = _inflate(dset, (r,) if dset.ndim == 1 else (r, c), k)
-
-    list(pool.map(one, [(r, c) for r in range(0, n, step) for c in range(cols)]))
+    n = dset.shape[0]
+    cols = [0] if dset.ndim == 1 else range(0, dset.shape[1], dset.chunks[1])
+    jobs = [(r, c) for r in range(0, n, dset.chunks[0]) for c in cols]
+    list(pool.map(lambda job: _chunk_into(dset, out[job[0]:], *job), jobs))
     return out
 
 
 def row_blocks(dset, pool, ahead):
     """(first row, block) over a 2-D dataset, a chunk-row at a time, with `ahead` blocks
-    read in advance on `pool`."""
+    read in advance on `pool` (at least the one being read)."""
     n = dset.shape[0]
     if not _raw_ok(dset):
         step = dset.chunks[0] if dset.chunks else 1 << 22
@@ -82,13 +101,12 @@ def row_blocks(dset, pool, ahead):
     starts = list(range(0, n, step))
 
     def get(s):
-        k = min(step, n - s)
-        block = np.empty((k, dset.shape[1]), dtype=dset.dtype)
-        for c in range(dset.shape[1]):
-            block[:, c] = _inflate(dset, (s, c), k)
+        block = np.empty((min(step, n - s), dset.shape[1]), dtype=dset.dtype)
+        for c in range(0, dset.shape[1], dset.chunks[1]):
+            _chunk_into(dset, block, s, c)
         return s, block
 
-    pending = [pool.submit(get, s) for s in starts[:ahead]]
+    pending = [pool.submit(get, s) for s in starts[:max(int(ahead), 1)]]
     nxt = len(pending)
     while pending:
         f = pending.pop(0)

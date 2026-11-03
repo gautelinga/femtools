@@ -18,6 +18,7 @@ A deliberate exit that every rank takes together (a time-budget stop, say) raise
 Neither dolfin nor mpi4py is imported here: a command that never initialised MPI has no
 collective to hang in.
 """
+import contextlib
 import signal
 import sys
 import traceback
@@ -67,6 +68,30 @@ def run(main, argv=None):
         if comm is None:
             raise
         _abort(comm, traceback.format_exc().rstrip(), 1)
+
+
+@contextlib.contextmanager
+def aborting(comm, cleanup=None):
+    """A region the ranks of `comm` run collectively: an exception on any rank is
+    printed with its rank and aborts the job, since the others wait for it in the
+    region's collectives; `cleanup()` is called first (what the job leaves behind). With
+    no comm or one rank it propagates as usual.
+
+    Put it *inside* a file opened collectively (MPI-IO): the file's close is itself
+    collective, so an exception leaving through it first would block the failing rank
+    there, the others waiting in the write, and never reach the abort."""
+    try:
+        yield
+    except BaseException:
+        if comm is None or comm.Get_size() == 1:
+            raise
+        message = traceback.format_exc().rstrip()
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:       # noqa: BLE001 -- the abort is what matters now
+                pass
+        _abort(comm, message, 1)
 
 
 def _abort(comm, message, status):

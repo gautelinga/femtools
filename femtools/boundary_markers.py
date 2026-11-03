@@ -95,15 +95,21 @@ class BoundaryMarkers(df.cpp.mesh.MeshFunctionSizet):
     @classmethod
     def read(cls, path, mesh, block=BLOCK):
         """The markers of `path`'s facets on `mesh`'s exterior facets, matched by vertex
-        coordinates; every other facet 0. Each rank streams the file and keeps what lies
-        in its bounding box. Refuses a facet that matches no exterior facet. Collective."""
+        coordinates; every other facet 0. No rank reads the file whole: each reads one
+        block of the facets and their markers, fetches those facets' points
+        (`hdf5_rows.fetch_rows`), and sends each facet to every rank whose exterior
+        vertices' bounding box holds all its points, which matches it there. Refuses a
+        facet that matches no exterior facet. Collective. (`block`, the rows a read,
+        is kept for callers; the blocks are now the ranks'.)"""
         import h5py
         from scipy.spatial import cKDTree
         self = cls(mesh)
         comm = _comm(mesh)
+        size, rank = (1, 0) if comm is None else (comm.Get_size(), comm.Get_rank())
         D, x = mesh.topology().dim(), mesh.coordinates()
+        gdim = x.shape[1]
         facets, vertices, owned = _exterior(mesh)
-        near, ids, kept, marks = np.inf, [], [], []
+        near = np.inf
         if len(facets):
             pairs = [(0, 1)] if D == 2 else [(0, 1), (1, 2), (0, 2)]
             near = min(np.linalg.norm(x[vertices[:, a]] - x[vertices[:, b]], axis=1).min()
@@ -113,39 +119,44 @@ class BoundaryMarkers(df.cpp.mesh.MeshFunctionSizet):
         where = boundaries.datasets(path)
         if where[2] is None:
             raise ValueError(path + ": no markers")
-        with h5py.File(where[0][0], "r") as h5:
-            n_points = h5[where[0][1].lstrip("/")].shape[0]
         with h5py.File(where[1][0], "r") as h5:
             n_facets, nv = h5[where[1][1].lstrip("/")].shape
+        with h5py.File(where[0][0], "r") as h5:
+            width = h5[where[0][1].lstrip("/")].shape[1]
         bad = nv != D
         if hdf5_rows.agreed(comm, bad):
             raise ValueError("{}: facets of {} points, the mesh's of {}".format(path, nv, D))
-        if len(local):
-            lo, hi = x[local].min(axis=0) - tol, x[local].max(axis=0) + tol
-            tree = cKDTree(x[local])
-            with h5py.File(where[0][0], "r") as h5:
-                p = h5[where[0][1].lstrip("/")]
-                for start in range(0, n_points, block):
-                    b = np.asarray(p[start:start + block])
-                    inside = np.flatnonzero(((b >= lo) & (b <= hi)).all(axis=1))
-                    dist, k = tree.query(b[inside], distance_upper_bound=tol)
-                    hit = np.isfinite(dist)
-                    ids.append(start + inside[hit])
-                    kept.append(local[k[hit]])
-        ids = np.concatenate(ids) if ids else np.zeros(0, np.int64)
-        kept = np.concatenate(kept) if kept else np.zeros(0, np.int64)
-        rows, marks = [], []
-        if len(ids):
-            with h5py.File(where[1][0], "r") as fh, h5py.File(where[2][0], "r") as mh:
-                f, m = fh[where[1][1].lstrip("/")], mh[where[2][1].lstrip("/")]
-                for start in range(0, n_facets, block):
-                    b = np.asarray(f[start:start + block], dtype=np.int64)
-                    pos = np.minimum(np.searchsorted(ids, b), len(ids) - 1)
-                    full = (ids[pos] == b).all(axis=1)
-                    rows.append(kept[pos[full]])
-                    marks.append(np.asarray(m[start:start + block]).ravel()[full])
-        rows = np.concatenate(rows) if rows else np.zeros((0, D), np.int64)
-        marks = np.concatenate(marks).astype(np.int64) if marks else np.zeros(0, np.int64)
+        # this rank's block of the facets and markers, and their points' coordinates
+        edges = hdf5_rows.block_edges(n_facets, size)
+        a, b = int(edges[rank]), int(edges[rank + 1])
+        with h5py.File(where[1][0], "r") as fh, h5py.File(where[2][0], "r") as mh:
+            given = np.asarray(fh[where[1][1].lstrip("/")][a:b], dtype=np.int64).reshape(-1, nv)
+            marks = np.asarray(mh[where[2][1].lstrip("/")][a:b]).ravel().astype(np.int64)
+        pts = hdf5_rows.fetch_rows(where[0][0], where[0][1].lstrip("/"), given.ravel(), comm)
+        pts = np.asarray(pts, float).reshape(len(given), nv, width)[:, :, :gdim]
+        if comm is not None:
+            box = ((x[local].min(axis=0) - tol, x[local].max(axis=0) + tol) if len(local)
+                   else (np.full(gdim, np.inf), np.full(gdim, -np.inf)))
+            take, dest = [], []
+            for r, (lo, hi) in enumerate(comm.allgather(box)):
+                inside = np.flatnonzero(((pts >= lo) & (pts <= hi)).all(axis=(1, 2)))
+                take.append(inside)
+                dest.append(np.full(len(inside), r, np.int64))
+            take = np.concatenate(take)
+            pts, marks = hdf5_rows.route(comm, np.concatenate(dest),
+                                         pts[take].reshape(len(take), nv * gdim),
+                                         marks[take]).received
+            pts = pts.reshape(len(pts), nv, gdim)
+        # each received facet's points matched to this rank's exterior vertices; a facet
+        # all of whose points match is a candidate for one of its exterior facets
+        rows = np.zeros((0, D), np.int64)
+        if len(local) and len(pts):
+            dist, k = cKDTree(x[local]).query(pts.reshape(-1, gdim), distance_upper_bound=tol)
+            dist, k = dist.reshape(len(pts), nv), k.reshape(len(pts), nv)
+            full = np.isfinite(dist).all(axis=1)
+            rows, marks = local[k[full]], marks[full]
+        else:
+            marks = marks[:0]
         mine = _row_keys(vertices)
         order = np.argsort(mine)
         theirs = _row_keys(rows)

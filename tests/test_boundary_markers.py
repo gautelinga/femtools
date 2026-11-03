@@ -175,3 +175,29 @@ def test_three_ranks_write_and_read_the_one_rank_file(tmp_path):
     assert np.array_equal(boundaries.read(one)[0], boundaries.read(three)[0])
     assert by_position(one) == by_position(three)
     assert np.array_equal(BoundaryMarkers.read(three, mesh).array(), expected(b))
+
+
+FEW = r"""
+import sys
+import dolfin as df
+from femtools.boundaries import BoundaryMarkers
+mesh = df.UnitSquareMesh(df.MPI.comm_world, 8, 8)
+for upto, want in ((0.13, 1), (-1.0, 0)):
+    m = BoundaryMarkers(mesh)
+    m.mark(df.CompiledSubDomain("on_boundary && near(x[0], 0) && x[1] < %g" % upto), 3)
+    m.write(sys.argv[1])
+    r = BoundaryMarkers.read(sys.argv[1], mesh)
+    n = df.MPI.sum(df.MPI.comm_world, float((r.array() == 3).sum()))
+    if df.MPI.rank(df.MPI.comm_world) == 0:
+        print("READ", int(n), "OF", want)
+"""
+
+
+@pytest.mark.mpi
+def test_fewer_facets_than_ranks_and_none(tmp_path):
+    """One marked facet on three ranks, and none: ranks with nothing to send take part
+    in the exchange rather than raising before it"""
+    proc = support.run([sys.executable, "-c", FEW, str(tmp_path / "few.xdmf")], 3,
+                       timeout=300,
+                       env=dict(PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    assert "READ 1 OF 1" in proc.stdout and "READ 0 OF 0" in proc.stdout, proc.stdout

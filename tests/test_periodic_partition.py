@@ -299,11 +299,11 @@ def test_rows_of_nothing_are_rows():
 
 
 def test_unique_rows_is_numpys():
-    """The repair's `_unique_rows` is `np.unique(axis=0)`, the same rows in the same order,
+    """`hdf5_rows.unique_rows` is `np.unique(axis=0)`, the same rows in the same order,
     on rows that pack into one key (vertex numbers, -1 for no second end, ranks) and on
     rows whose ranges do not."""
     import numpy as np
-    from femtools.periodic_partition import _unique_rows
+    from femtools.hdf5_rows import unique_rows as _unique_rows
     rng = np.random.default_rng(2)
     for top in (5, 1 << 20, 1 << 40):
         rows = np.stack([rng.integers(0, 2, 5000), rng.integers(0, top, 5000),
@@ -350,3 +350,79 @@ def test_a_rebuild_on_one_rank_is_the_same_mesh():
     assert np.array_equal(mesh.coordinates()[np.argsort(gv)], new.coordinates()[np.argsort(nv)])
     (cells,), (verts,) = plan.carry(new, [gc], [gv])
     assert np.array_equal(cells, nc) and np.array_equal(verts, nv)
+
+
+BELOW_ZERO = r"""
+import os, sys
+import numpy as np, h5py, dolfin as df
+from mpi4py import MPI
+from femtools import periodic_partition as pp
+from femtools.periodic import periodic_box
+comm = MPI.COMM_WORLD
+tmp, shift = sys.argv[1], float(sys.argv[2])
+periodic, tol = (True,) * 3, 1e-8
+serial = df.UnitCubeMesh(MPI.COMM_SELF, 6, 6, 6)
+x = serial.coordinates().copy()
+topo = serial.cells().astype(np.int64)
+# the worker's crafted partition: a cell touching x=1 at one vertex moved to rank 1
+owner = (x[topo].mean(1)[:, 1] >= 0.5).astype(np.int64)
+on_x1 = np.abs(x[:, 0] - 1.0) < tol
+deep = on_x1 & (np.abs(x[:, 1] - 1.0 / 6) < tol) & (x[:, 2] > tol) & (x[:, 2] < 1 - tol)
+touch = np.nonzero((on_x1[topo].sum(1) == 1) & deep[topo].any(1) & (owner == 0))[0]
+owner[touch[0]] = 1
+x = x + shift
+lo, L = np.full(3, shift), np.full(3, 1.0 + shift)
+path = os.path.join(tmp, 'crafted.h5')
+if comm.rank == 0:
+    perm = np.argsort(owner, kind='stable')
+    with h5py.File(path, 'w') as h:
+        h['mesh/coordinates'] = x
+        t = h.create_dataset('mesh/topology', data=topo[perm])
+        t.attrs['celltype'] = np.bytes_('tetrahedron')
+        t.attrs['partition'] = np.searchsorted(owner[perm], np.arange(comm.size)).astype(np.uint64)
+        h['mesh/cell_indices'] = perm.astype(np.int64)
+comm.Barrier()
+mesh = df.Mesh()
+with df.HDF5File(comm, path, 'r') as h:
+    h.read(mesh, 'mesh', True)
+logs = []
+mesh = pp.repaired(mesh, L, periodic, comm, log=logs.append, tol=1e-10)
+W = df.FunctionSpace(mesh, 'CG', 1, constrained_domain=periodic_box(L, 1e-10, periodic, lo))
+pp.check_space_pairing(W, L, periodic, comm, lower=lo, tol=1e-10)
+if comm.rank == 0:
+    print('MOVED', logs[0].split()[2])
+"""
+
+
+@pytest.mark.mpi
+@pytest.mark.parametrize('shift', [-1.0, -3.5])
+def test_a_box_at_or_below_zero_is_repaired(tmp_path, shift):
+    """The crafted partition on a box whose upper corner is at or below 0, with the
+    constraint's own tolerance passed: the face tolerance scales with the box's extent,
+    not its corner (which made it 0 or negative, and the repair blind), so the cell is
+    moved and the pairing holds."""
+    proc = support.run([sys.executable, "-c", BELOW_ZERO, str(tmp_path), str(shift)], 2,
+                       cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert "MOVED 1" in proc.stdout, proc.stdout[-2000:]
+
+
+GHOSTED = r"""
+import numpy as np, dolfin as df
+from mpi4py import MPI
+from femtools import periodic_partition as pp
+df.parameters['ghost_mode'] = 'shared_facet'
+comm = MPI.COMM_WORLD
+mesh = df.UnitCubeMesh(6, 6, 6)
+out = pp.rebuild(mesh, np.full(mesh.num_cells(), 1 - comm.rank))
+gc = np.concatenate(comm.allgather(np.asarray(out.topology().global_indices(3))))
+if comm.rank == 0:
+    print('CELLS', len(gc), len(np.unique(gc)), mesh.num_entities_global(3))
+"""
+
+
+@pytest.mark.mpi
+def test_a_ghosted_mesh_is_rebuilt_from_its_owned_cells():
+    """With ghost cells (`shared_facet`), each cell is built once, by its owner."""
+    proc = support.run([sys.executable, "-c", GHOSTED], 2,
+                       cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert "CELLS 1296 1296 1296" in proc.stdout, proc.stdout[-2000:]

@@ -17,9 +17,12 @@ do not touch dolfin also serve readers without it, such as partrac's tools.
 - **`xdmfread`**: reads datasets with their gzip chunks inflated on a thread pool, whole or
   a chunk-row at a time. h5py inflates on one thread, which takes hours at billions of cells.
 - **`compress`, `hdf5_rows`**: compressed datasets, and rows of them read, written and
-  exchanged between MPI ranks without any rank holding a whole one.
+  exchanged between MPI ranks without any rank holding a whole one. Under MPI every rank
+  writes its own block, through MPI-IO (rank zero writes them all only with a serial h5py).
 - **`dolfin_layout`**: a Mesh or Function written in the layout `dolfin.HDF5File` gives it,
-  compressed; `write_mesh_arrays` without dolfin.
+  compressed, which dolfin reads on any number of ranks; `write_dofs` writes a space's dof
+  tables once, for Functions that link them (a checkpoint of vectors alone);
+  `write_mesh_arrays` without dolfin.
 - **`boundaries`**: a boundary facet file (facets, an integer marker each, the points they
   use), written serially or from blocks on many ranks, and read back. It is the layout
   partrac's `wall_facets` reads. `BoundaryMarkers` is a facet MeshFunction that writes its

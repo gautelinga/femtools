@@ -86,3 +86,107 @@ def test_every_gradient_snapshot_holds_every_component(which):
         snap = np.array(probe.get_probe_grad_at_snapshot(1))
         assert snap.shape == (want.shape[1],)
         assert np.allclose(snap, want[index], rtol=0, atol=1e-10)
+
+
+def square():
+    mesh = df.UnitSquareMesh(8, 8)
+    V = df.FunctionSpace(mesh, "CG", 1)
+    return mesh, V, df.interpolate(df.Expression("x[0] + 2*x[1]", degree=1), V)
+
+
+def test_a_restarted_snapshot_counts():
+    """`restart_probe` is a snapshot of its own: the next evaluation is the next one."""
+    from femtools.probes import Probe
+    _, V, u = square()
+    p = Probe(np.array([0.3, 0.4]), V)
+    p.restart_probe(np.array([7.0]))
+    p(u)
+    assert p.number_of_evaluations() == 2
+    assert np.allclose(p.get_probe_sub(0), [7.0, 1.1])
+
+
+def test_one_component_is_that_component():
+    mesh = df.UnitSquareMesh(4, 4)
+    W = df.VectorFunctionSpace(mesh, "CG", 1)
+    w = df.interpolate(df.Expression(("1.0", "2.0"), degree=0), W)
+    q = Probes(np.array([0.3, 0.4, 0.6, 0.6]), W)
+    q(w)
+    assert np.allclose(q.array(N=0, component=1), [2.0, 2.0])
+    assert np.allclose(q.array(component=0), [1.0, 1.0])
+
+
+def test_points_from_a_strided_array_and_outside_the_mesh():
+    """A column slice of an array is read as the points it holds; a point outside the
+    mesh is held by no rank and reads 0."""
+    _, V, u = square()
+    pts = np.array([[0.1, 0.2, 99.0], [0.7, 0.8, 99.0], [2.0, 2.0, 99.0]])[:, :2]
+    r = Probes(pts, V)
+    r(u)
+    assert r.local_size() == 2 and r.get_total_number_probes() == 3
+    assert np.allclose(r.array(N=0), [0.5, 2.3, 0.0])
+
+
+def test_out_of_range_is_refused():
+    """A snapshot, component or local probe past the end raises; positions are not
+    added once there are snapshots the new probes would lack."""
+    _, V, u = square()
+    p = Probes(np.array([0.3, 0.4]), V)
+    p(u)
+    p(u)
+    with pytest.raises(IndexError):
+        p.array(N=2)
+    with pytest.raises(IndexError):
+        p.array(component=1)
+    for call in (lambda: p.get_probe(1), lambda: p.erase_snapshot(2),
+                 lambda: p.get_probes_component_and_snapshot(0, 5),
+                 lambda: p.add_positions(np.array([0.9, 0.9]), V)):
+        with pytest.raises(RuntimeError):
+            call()
+
+
+def test_erasing_a_gradient_snapshot_keeps_the_histories_aligned():
+    _, V, u = square()
+    g = GradProbes(np.array([0.3, 0.4]), V)
+    g.grad(u)
+    g.grad(u)
+    g.erase_snapshot(0)
+    assert g.number_of_evaluations() == g.number_of_grad_evaluations() == 1
+    assert g.array_grad(N=0).shape == (2,)
+    g.clear()
+    assert g.number_of_evaluations() == g.number_of_grad_evaluations() == 0
+
+
+BOUNDARY = r"""
+import numpy as np, dolfin as df
+from mpi4py import MPI
+from femtools.probes import Probes
+comm = MPI.COMM_WORLD
+mesh = df.UnitSquareMesh(8, 8)
+V = df.FunctionSpace(mesh, "CG", 1)
+u = df.interpolate(df.Expression("x[0] + 2*x[1]", degree=1), V)
+pts = np.array([[i / 8, j / 8] for i in range(9) for j in range(9)])   # every vertex
+p = Probes(pts.flatten(), V)
+p(u)
+n = comm.allreduce(p.local_size())
+a = p.array(N=0)
+if comm.rank == 0:
+    print("HELD", n, "EXACT", bool(np.allclose(a, pts[:, 0] + 2 * pts[:, 1])))
+"""
+
+
+@pytest.mark.mpi
+def test_a_point_on_a_partition_boundary_is_held_once():
+    """Every vertex of the mesh as a point, on three ranks: each is held by one rank
+    (the lowest finding it), and gathered to its value."""
+    import os
+    import sys
+    from tests import support
+    proc = support.run([sys.executable, "-c", BOUNDARY], 3,
+                       cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    assert "HELD 81 EXACT True" in proc.stdout, proc.stdout[-2000:]
+
+
+def test_an_array_before_any_evaluation_is_empty():
+    _, V, _ = square()
+    p = Probes(np.array([0.3, 0.4, 0.5, 0.5]), V)
+    assert np.asarray(p.array()).size == 0

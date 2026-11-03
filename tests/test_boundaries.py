@@ -63,22 +63,44 @@ points, facets, markers = rng.random((n, 3)), rng.integers(0, n, (nf, 3)), rng.i
 # uneven blocks, rank 1 holding no points and rank 0 no facets
 p = [0, 200, 200, n][comm.rank:comm.rank + 2]
 f = [0, 0, 300, nf][comm.rank:comm.rank + 2]
-boundaries.write(sys.argv[1], points[p[0]:p[1]], facets[f[0]:f[1]], markers[f[0]:f[1]], comm)
+if sys.argv[2] == "empty":      # nothing marked anywhere
+    p = f = [0, 0]
+mine = points[p[0]:p[1]]
+if comm.rank == 1 and sys.argv[2] == "blocks":
+    mine = np.zeros(0)          # an empty block passed 1-D
+boundaries.write(sys.argv[1], mine, facets[f[0]:f[1]], markers[f[0]:f[1]], comm)
 """
 
 
 @pytest.mark.mpi
 def test_three_ranks_write_their_blocks_in_rank_order(tmp_path):
-    """Three ranks, each passing an uneven block of each array (one passing none), write
-    what one rank writes from the whole arrays."""
+    """Three ranks, each passing an uneven block of each array (one passing none, as a
+    1-D empty array), write what one rank writes from the whole arrays."""
     pytest.importorskip("mpi4py")
     points, facets, markers = case()
     one, three = str(tmp_path / "one.xdmf"), str(tmp_path / "three.xdmf")
     boundaries.write(one, points, facets, markers)
-    support.run([sys.executable, "-c", WORKER, three], 3, timeout=300,
+    support.run([sys.executable, "-c", WORKER, three, "blocks"], 3, timeout=300,
                 env=dict(PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     for a, b in zip(boundaries.read(one), boundaries.read(three)):
         assert np.array_equal(a, b) and a.dtype == b.dtype
     with h5py.File(str(tmp_path / "three.h5"), "r") as h5:
         assert all(h5[k].compression == "gzip" for k in h5)
+    assert open(one).read() == open(three).read().replace("three.h5", "one.h5")
+
+
+@pytest.mark.mpi
+@pytest.mark.parametrize("h5py_build", ["mpio", "gather"])
+def test_three_ranks_write_nothing(tmp_path, h5py_build):
+    """Nothing marked on any of three ranks: the file is the empty one one rank writes,
+    through MPI-IO (whose zero-size datasets have no storage to write to) or rank zero."""
+    pytest.importorskip("mpi4py")
+    one, three = str(tmp_path / "one.xdmf"), str(tmp_path / "three.xdmf")
+    boundaries.write(one, np.zeros((0, 3)), np.zeros((0, 3), np.int64), np.zeros(0, np.int64))
+    env = {"mpio": {"H5PY_ALWAYS_USE_MPI": "1"}, "gather": {"H5PY_NEVER_USE_MPI": "1"}}
+    support.run([sys.executable, "-c", WORKER, three, "empty"], 3, timeout=300,
+                env=dict(env[h5py_build],
+                         PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    for a, b in zip(boundaries.read(one), boundaries.read(three)):
+        assert a.shape == b.shape and len(a) == 0 and a.dtype == b.dtype
     assert open(one).read() == open(three).read().replace("three.h5", "one.h5")

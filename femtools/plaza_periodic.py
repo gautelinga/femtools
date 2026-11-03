@@ -82,12 +82,16 @@ using namespace dolfin;
 // A vertex's position with each upper periodic plane mapped onto the lower one: the
 // same for a vertex and its periodic partner, and on every rank -- unlike its global
 // index, which the two faces number independently.
-std::array<double, 3> periodic_key(const Vertex& v, const std::vector<double>& box,
+std::array<double, 3> periodic_key(const Vertex& v, const std::vector<double>& lower,
+                                   const std::vector<double>& box,
                                    const std::vector<std::size_t>& axes, double tol)
 {
-  std::array<double, 3> k = {v.x(0), v.x(1), v.x(2)};
+  std::array<double, 3> k = {0.0, 0.0, 0.0};
+  const std::size_t gdim = v.mesh().geometry().dim();
+  for (std::size_t d = 0; d < gdim; ++d)
+    k[d] = v.x(d);
   for (auto a : axes)
-    if (std::abs(k[a] - box[a]) < tol) k[a] = 0.0;
+    if (std::abs(k[a] - box[a]) < tol) k[a] = lower[a];
   return k;
 }
 
@@ -110,8 +114,8 @@ bool key_less(const std::array<double, 3>& p, const std::array<double, 3>& q, do
 // largest periodic_key of the opposite vertex: a position, so the same on both faces and
 // on every rank, which is all dolfin's global index was there for.
 void face_long_edge(std::vector<unsigned int>& long_edge, const Mesh& mesh,
-                    const std::vector<double>& box, const std::vector<std::size_t>& axes,
-                    double tol)
+                    const std::vector<double>& lower, const std::vector<double>& box,
+                    const std::vector<std::size_t>& axes, double tol)
 {
   mesh.init(1); mesh.init(2); mesh.init(2, 1);
   long_edge.resize(mesh.num_faces());
@@ -130,7 +134,7 @@ void face_long_edge(std::vector<unsigned int>& long_edge, const Mesh& mesh,
     {
       if (edge_length[face_edges[i]] < max_len * (1.0 - 1e-10)) continue;
       const std::array<double, 3> k
-        = periodic_key(Vertex(mesh, f->entities(0)[i]), box, axes, tol);
+        = periodic_key(Vertex(mesh, f->entities(0)[i]), lower, box, axes, tol);
       if (imax == 3 || key_less(best, k, tol)) { imax = i; best = k; }
     }
     long_edge[f->index()] = face_edges[imax];
@@ -398,20 +402,21 @@ std::pair<std::size_t, std::size_t> count_children(const Mesh& mesh, ParallelRef
 py::tuple refine_periodic(Mesh& new_mesh, const Mesh& mesh,
                           const MeshFunction<bool>& marker,
                           const std::vector<std::size_t>& axes,
+                          const std::vector<double>& lower,
                           const std::vector<double>& box,
                           double tol, bool redistribute, std::size_t max_cells,
                           std::size_t max_rank_cells,
                           const std::vector<std::size_t>& frozen)
 {
   std::vector<unsigned int> long_edge;
-  face_long_edge(long_edge, mesh, box, axes, tol);
+  face_long_edge(long_edge, mesh, lower, box, axes, tol);
 
   std::vector<std::size_t> partner_local, partner_rank, partner_remote;
   for (auto axis : axes)
   {
     std::vector<bool> mask(3, false);
     mask[axis] = true;
-    CppPeriodicBox sub(std::vector<double>(3, 0.0), box, mask, tol, tol);
+    CppPeriodicBox sub(lower, box, mask, tol, tol);
     add_periodic_partners(mesh, sub, partner_local, partner_rank, partner_remote);
   }
 
@@ -505,11 +510,13 @@ class TooManyCells(Exception):
 
 
 def refine_periodic(mesh, markers, box, axes, redistribute=True, tol=1e-10,
-                    max_cells=None, max_rank_cells=None, frozen=None, report=None):
+                    max_cells=None, max_rank_cells=None, frozen=None, report=None,
+                    lower=None):
     """`df.refine(mesh, markers)`, with the identified faces bisected alike.
 
-    `box` is the periodic box's upper corner (the lower is the origin), `axes` the periodic
-    axes. Works at any rank count. `redistribute=True` matches `df.refine`'s default; a
+    `box` is the periodic box's upper corner and `lower` its lower one
+    (`periodic.box_lower`: the origin when None, which a mesh elsewhere is refused),
+    `axes` the periodic axes. 2D and 3D. Works at any rank count. `redistribute=True` matches `df.refine`'s default; a
     pass that grows the mesh a few percent is much faster without the repartition, and
     gives the same mesh.
 
@@ -537,8 +544,11 @@ def refine_periodic(mesh, markers, box, axes, redistribute=True, tol=1e-10,
     if cap < 0 or rank_cap < 0:
         raise ValueError("max_cells and max_rank_cells must be positive, got {} and {}"
                          .format(max_cells, max_rank_cells))
+    from femtools.periodic import box_lower, xyz
+    lower = box_lower(mesh, axes, lower)
     npair, parent, n_children, n_rank, n_unmarked, n_frozen = _cpp().refine_periodic(
-        new_mesh, mesh, markers, [int(a) for a in axes], [float(b) for b in box], tol,
+        new_mesh, mesh, markers, [int(a) for a in axes], [float(v) for v in lower],
+        [float(b) for b in xyz(box)], tol,
         redistribute, cap, rank_cap,
         [] if frozen is None else [int(e) for e in np.asarray(frozen).ravel()])
     if report is not None:

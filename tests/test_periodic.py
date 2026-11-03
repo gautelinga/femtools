@@ -103,3 +103,43 @@ def test_connectivity_is_dolfins_as_an_array():
         assert np.array_equal(a, np.asarray(mesh.topology()(d0, d1)()).reshape(a.shape))
     with pytest.raises(ValueError):
         connectivity(mesh, 0, 3)
+
+
+@pytest.mark.parametrize("n", [4, 5, 6])
+def test_faces_congruent_on_a_2d_mesh(n):
+    """2D coordinates are padded, not reshaped as 3D rows."""
+    from femtools.periodic import faces_congruent
+    assert faces_congruent(df.UnitSquareMesh(n, n), [1.0, 1.0], [0, 1], edges=True)[0]
+
+
+def test_a_box_off_the_origin_needs_its_lower_corner():
+    """A centred box is compared at its own faces with `lower`, and refused without it
+    rather than compared with the plane through its middle."""
+    from femtools.periodic import faces_congruent
+    mesh = df.BoxMesh(df.Point(-.5, -1, -.5), df.Point(.5, 1, .5), 3, 4, 3)
+    with pytest.raises(ValueError, match="lower corner"):
+        faces_congruent(mesh, [.5, 1, .5], [0, 1, 2])
+    assert faces_congruent(mesh, [.5, 1, .5], [0, 1, 2], edges=True, lower=[-.5, -1, -.5])[0]
+    # a face moved off its partner is seen
+    x = mesh.coordinates()
+    x[np.abs(x[:, 0] + .5) < 1e-12, 1] += 1e-3
+    assert not faces_congruent(mesh, [.5, 1, .5], [0], lower=[-.5, -1, -.5])[0]
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_refining_a_centred_box_keeps_its_faces_paired(dim):
+    """Cells marked near one face only of a centred box: its partner face is bisected
+    alike, and the guard compares the box's own faces."""
+    from femtools.refine_periodic import refine_congruent
+    if dim == 2:
+        mesh = df.RectangleMesh(df.Point(-.5, -.5), df.Point(.5, .5), 6, 6)
+    else:
+        mesh = df.BoxMesh(df.Point(-.5, -.5, -.5), df.Point(.5, .5, .5), 4, 4, 4)
+    marked = df.MeshFunction("bool", mesh, dim, False)
+    for c in df.cells(mesh):
+        marked[c] = c.midpoint().x() < -0.3
+    new, _, _ = refine_congruent(mesh, marked, [.5] * dim, list(range(dim)),
+                                 lower=[-.5] * dim)
+    x = new.coordinates()
+    assert new.num_cells() > mesh.num_cells()
+    assert np.sum(np.abs(x[:, 0] + .5) < 1e-9) == np.sum(np.abs(x[:, 0] - .5) < 1e-9)

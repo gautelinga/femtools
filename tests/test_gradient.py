@@ -1,6 +1,7 @@
 """`femtools.gradient`: the weighted gradient matrix gives the exact derivatives of a
 linear p on P1 in 2D and 3D, weighs the cells around a node by 1/|K| (checked by hand
-on unequal cells), and gives the same values on 2 ranks as on one."""
+on unequal cells), and gives the same values on 2 ranks as on one, with ghost cells too;
+one weight matrix serves every direction."""
 import os
 import sys
 
@@ -81,14 +82,37 @@ def test_one_over_volume_weighting_by_hand():
     assert not np.allclose(got, weighted, atol=1e-6)
 
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(scope="module")
+def serial_rows(tmp_path_factory):
+    """The worker's rows on one rank, the reference for every parallel run."""
+    out = tmp_path_factory.mktemp("gradient") / "one.npy"
+    support.run([sys.executable, WORKER, str(out)], 1, env={"PYTHONPATH": ROOT}, timeout=600)
+    return np.load(out)
+
+
 @pytest.mark.mpi
-def test_two_ranks_match_serial(tmp_path):
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = {"PYTHONPATH": root}
-    support.run([sys.executable, WORKER, str(tmp_path / "one.npy")], 1, env=env, timeout=600)
-    support.run([sys.executable, WORKER, str(tmp_path / "two.npy")], 2, env=env, timeout=600)
-    a, b = np.load(tmp_path / "one.npy"), np.load(tmp_path / "two.npy")
+@pytest.mark.parametrize("ghost_mode", ["none", "shared_facet"])
+def test_two_ranks_match_serial(tmp_path, serial_rows, ghost_mode):
+    """On two ranks the values are serial's, ghost cells or none: a ghost cell is its
+    owner's to weigh, once."""
+    support.run([sys.executable, WORKER, str(tmp_path / "two.npy"), ghost_mode], 2,
+                env={"PYTHONPATH": ROOT}, timeout=600)
+    a, b = serial_rows, np.load(tmp_path / "two.npy")
     assert a.shape == b.shape
     a, b = a[np.lexsort(a[:, :3].T)], b[np.lexsort(b[:, :3].T)]
     assert np.allclose(a[:, :3], b[:, :3], rtol=0, atol=1e-14)
     assert np.allclose(a[:, 3:], b[:, 3:], rtol=0, atol=1e-12)
+
+
+def test_every_direction_from_one_weight_matrix():
+    """`weighted_gradient_matrix` with several directions is each direction's own."""
+    mesh = df.UnitCubeMesh(3, 2, 4)
+    Q = df.FunctionSpace(mesh, "CG", 1)
+    p = df.interpolate(df.Expression("x[0]*x[1] + x[2]*x[2]", degree=2), Q)
+    together = weighted_gradient_matrix(mesh, (0, 1, 2))
+    for i in range(3):
+        alone = weighted_gradient_matrix(mesh, i)
+        assert np.allclose(apply(together[i], p, Q), apply(alone, p, Q), rtol=0, atol=1e-13)

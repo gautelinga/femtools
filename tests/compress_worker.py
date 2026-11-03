@@ -1,5 +1,6 @@
 """Worker for tests/test_compress.py: `hdf5_rows.write_ordered` on the ranks mpirun gives,
-with messages capped small, so a rank's block goes to rank zero in several batches; and
+through MPI-IO or, with h5py's serial build, through rank zero with messages capped small,
+so a rank's block goes to rank zero in several batches; and
 rows already one run a rank in rank order (the path that sends no index), whose stored
 chunks are the scattered path's to the byte.
 
@@ -38,6 +39,7 @@ def main(out):
     assert hdf5_rows._runs(comm, runs, len(a)) is not None
     assert hdf5_rows._runs(comm, runs[::-1].copy(), len(a)) is None   # some rank holds two
     if comm.rank == 0:
+        print("mpio" if hdf5_rows.mpio(comm) else "gather")
         with h5py.File(path, "r") as h:
             for name, a in whole.items():
                 assert np.array_equal(h[name][()], a), name

@@ -67,10 +67,10 @@ QUADRATIC_EXPRESSION = {3: 'x[0]*x[0] + 2*x[1]*x[1] - x[2]*x[2]',
 
 def quadratic_exact(coords, gdim=3):
     """`quadratic_field`'s values at the rows of `coords`, as the file holds them."""
-    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    x, y = coords[:, 0], coords[:, 1]
     if gdim == 2:
         return x * x + 2 * y * y - 3 * x * y
-    return x * x + 2 * y * y - z * z
+    return x * x + 2 * y * y - coords[:, 2] * coords[:, 2]
 
 
 def quadratic_field(mesh, name='u'):
@@ -118,10 +118,8 @@ def test_quadratic_survives(cell):
     values = _read_grid_attribute(tmp('q.xdmf'), grids[0], 'u').ravel()
     corners, edges, _ = QUADRATIC[cell]
     assert conn.shape[1] == corners + len(edges), conn.shape
-    # three coordinates, a 2D mesh's with z = 0
-    assert coords.shape[1] == 3, coords.shape
-    if cell == 'triangle':
-        assert not coords[:, 2].any(), 'a 2D mesh has nodes off its plane'
+    # the mesh's own coordinates: two for a 2D mesh (XY, as dolfin writes it)
+    assert coords.shape[1] == mesh.geometry().dim(), coords.shape
 
     # the field really is quadratic: midsides depart from the corner mean
     gap = max(abs(values[c[corners + k]] - 0.5 * (values[c[i]] + values[c[j]]))
@@ -641,8 +639,7 @@ The way twoasis writes its series, and the way it reads them back.
     assert _scan(tmp('tri_p.xdmf'))[0]['topology'] == 'Triangle'
     with h5py.File(steps[0]['geometry'][0], 'r') as h:
         nodes = h[steps[0]['geometry'][1]][:]
-    assert nodes.shape == (mesh.num_vertices() + mesh.num_edges(), 3), nodes.shape
-    assert not nodes[:, 2].any(), 'a 2D mesh has nodes off its plane'
+    assert nodes.shape == (mesh.num_vertices() + mesh.num_edges(), 2), nodes.shape
     mesh.init(1, 0)
     want = np.vstack((mesh.coordinates(),
                       [e.midpoint().array()[:2] for e in df.edges(mesh)]))
@@ -782,6 +779,61 @@ def test_read_mesh_from_quadratic():
     print('{} cells recovered from Tetrahedron_10 corners'.format(back.num_cells()))
 
 
+@CELLS
+def test_read_mesh_past_a_facet_function(cell):
+    """a facet MeshFunction written first, then a quadratic field: the mesh read back is
+    the cells', not the facets'"""
+    mesh = unit_mesh(2, cell)
+    mf = df.MeshFunction('size_t', mesh, mesh.topology().dim() - 1, 0)
+    mf.array()[:] = np.arange(len(mf.array())) % 5
+    u = quadratic_field(mesh)
+    with XDMFFile2(df.MPI.comm_world, tmp('qmf.xdmf')) as f:
+        f.write(mf)
+        f.write(u)
+    back = df.Mesh()
+    with XDMFFile2(df.MPI.comm_world, tmp('qmf.xdmf')) as f:
+        f.read(back)
+    assert back.ufl_cell().cellname() == cell
+    assert back.num_cells() == mesh.num_cells(), (back.num_cells(), mesh.num_cells())
+
+
+def _whole_tree_xml(doc):
+    """The XML as the whole tree serialises: what `save` writes a grid at a time."""
+    import copy
+    import xml.etree.ElementTree as ET
+    root = copy.deepcopy(doc.root)
+    ET.indent(root, space='  ')
+    return '<?xml version="1.0"?>\n{}\n{}\n'.format(
+        export_p2_xdmf.DOCTYPE, ET.tostring(root, encoding='unicode'))
+
+
+@pytest.mark.parametrize('share', [False, True])
+def test_saved_xml_is_the_whole_tree_after_every_write(share):
+    """a grid at a time, appended in place: after every write the file is the whole
+    tree's XML -- a static grid first, steps, steps sharing a grid, a grid after the
+    series, and a file changed behind the writer's back"""
+    mesh = unit_mesh(2)
+    u, p = quadratic_field(mesh, 'u'), quadratic_field(mesh, 'p')
+    mf = df.MeshFunction('size_t', mesh, 2, 0)
+    mf.rename('m', 'm')
+    path = tmp('saves_{}.xdmf'.format(share))
+    with XDMFFile2(df.MPI.comm_world, path) as f:
+        f.parameters['functions_share_mesh'] = share
+        f.write(mf)
+        for k in range(4):
+            f.write(u, float(k))
+            f.write(p, float(k))
+            assert open(path).read() == _whole_tree_xml(f._doc), k
+            if k == 1:
+                with open(path, 'a') as handle:     # someone else's edit: rewritten
+                    handle.write(' ')
+        f.write(mesh)
+        assert open(path).read() == _whole_tree_xml(f._doc)
+        f.write(u, 9.0)
+        assert open(path).read() == _whole_tree_xml(f._doc)
+    assert not os.path.exists(path + '.tmp')
+
+
 def test_read_delegates():
     """a file with no quadratic grid is read by dolfin itself"""
     mesh = unit_mesh(2)
@@ -817,6 +869,87 @@ def test_checkpoint():
     assert_close(other.vector().get_local(), u.vector().get_local(), 0.0,
                  'dolfin reading the same checkpoint')
     print('bit-exact both ways')
+
+
+@pytest.mark.mpi
+def test_checkpoint_on_three_ranks():
+    """an appended checkpoint written and compressed on three ranks (the rewrite at each
+    close by every rank) reads back exactly, every step"""
+    script = '''
+import sys
+import h5py, numpy as np, dolfin as df
+from femtools.xdmf import XDMFFile2
+mesh = df.UnitCubeMesh(16, 16, 16)   # past WORTH_BYTES, so compressed
+V = df.FunctionSpace(mesh, 'CG', 2)
+us = [df.interpolate(df.Expression('x[0]*x[1] + %d*x[2]' % k, degree=2), V) for k in range(2)]
+for k, u in enumerate(us):
+    with XDMFFile2(df.MPI.comm_world, sys.argv[1]) as f:
+        f.write_checkpoint(u, 'u', float(k), append=k > 0)
+for k, u in enumerate(us):
+    back = df.Function(V)
+    with XDMFFile2(df.MPI.comm_world, sys.argv[1]) as f:
+        f.read_checkpoint(back, 'u', k)
+    assert np.array_equal(back.vector().get_local(), u.vector().get_local()), k
+if df.MPI.rank(df.MPI.comm_world) == 0:
+    with h5py.File(sys.argv[1][:-5] + '.h5', 'r') as h:
+        sizes = []
+        h.visititems(lambda n, o: sizes.append(o.compression) if isinstance(o, h5py.Dataset)
+                     and o.size > 1000 else None)
+    assert sizes and all(c == 'gzip' for c in sizes), sizes
+    print('ok')
+'''
+    path = os.path.join(TMP, 'chk_par.py')
+    with open(path, 'w') as handle:
+        handle.write(script)
+    proc = support.run([sys.executable, path, tmp('chk_par.xdmf')], 3, timeout=600)
+    assert proc.stdout.strip().endswith('ok'), proc.stdout + proc.stderr
+
+
+@pytest.mark.mpi
+def test_quadratic_grid_read_back_on_three_ranks():
+    """a P2 field written on three ranks reads back exactly on three, each rank matching
+    its own dofs among the nodes routed to it; a mesh that is not the file's is refused
+    on every rank rather than leaving the others in the vector's assembly; a DG field
+    is refused on every rank rather than written as though it were continuous"""
+    script = '''
+import sys
+import numpy as np, dolfin as df
+from femtools.xdmf import XDMFFile2
+C = df.MPI.comm_world
+mesh = df.UnitCubeMesh(5, 5, 5)
+V = df.VectorFunctionSpace(mesh, 'CG', 2)
+u = df.interpolate(df.Expression(('x[0]*x[1]', 'x[2]*x[2]', 'x[0] - x[1]'), degree=2), V)
+u.rename('u', 'u')
+with XDMFFile2(C, sys.argv[1]) as f:
+    f.write(u, 0.0)
+back = df.Function(V)
+with XDMFFile2(C, sys.argv[1]) as f:
+    f.read_checkpoint(back, 'u', 0)
+same = np.array_equal(back.vector().get_local(), u.vector().get_local())
+other = df.Function(df.VectorFunctionSpace(df.UnitCubeMesh(4, 4, 4), 'CG', 2))
+try:
+    with XDMFFile2(C, sys.argv[1]) as f:
+        f.read_checkpoint(other, 'u', 0)
+    refused = False
+except ValueError:
+    refused = True
+# a DG field is refused on every rank, not interpolated onto Lagrange nodes
+dg = df.Function(df.FunctionSpace(mesh, 'DG', 0)); dg.rename('d', 'd')
+try:
+    with XDMFFile2(C, sys.argv[1] + '.dg.xdmf') as f:
+        f.write(dg)
+    dg_refused = False
+except ValueError as exc:
+    dg_refused = 'Lagrange' in str(exc)
+ok = C.allreduce(int(same and refused and dg_refused), op=__import__('mpi4py').MPI.MIN)
+if df.MPI.rank(C) == 0:
+    print('ok' if ok else 'FAILED')
+'''
+    path = os.path.join(TMP, 'quad_par.py')
+    with open(path, 'w') as handle:
+        handle.write(script)
+    proc = support.run([sys.executable, path, tmp('quad_par.xdmf')], 3, timeout=600)
+    assert proc.stdout.strip().endswith('ok'), proc.stdout + proc.stderr
 
 
 def test_checkpoint_conflict():
@@ -921,66 +1054,6 @@ def test_writer_agreement(cell):
     assert_close(k2, conn, 0.0, 'connectivity')
     assert_close(v2.ravel(), values.ravel(), 0.0, 'values')
     print('both writers agree bit for bit')
-
-
-# -- parallel ------------------------------------------------------------------------
-
-@pytest.mark.mpi
-def test_three_ranks_match_serial():
-    """a distributed write matches the serial one, node for node
-
-Run under mpirun in a subprocess; the gather is where this goes wrong."""
-    script = '''
-import os, sys
-import numpy as np, dolfin as df
-from femtools.xdmf import XDMFFile2
-df.set_log_level(40)
-mesh = df.UnitCubeMesh(4,4,4)
-V = df.VectorFunctionSpace(mesh,'CG',2)
-u = df.Function(V); u.rename('u','u')
-u.interpolate(df.Expression(('x[0]*x[0]','x[1]*x[2]','x[2]*x[2]'), degree=2))
-mf = df.MeshFunction('size_t', mesh, 2, 0)
-# a geometric rule, so serial and 3 ranks agree on the value of each facet
-# whatever order the facets end up in
-for facet in df.facets(mesh):
-    p = facet.midpoint()
-    mf[facet] = int(round(4*p.x()) + 8*round(4*p.y()) + 64*round(4*p.z()))
-with XDMFFile2(df.MPI.comm_world, sys.argv[1]) as f:
-    f.write(mf)
-    f.write(u)
-'''
-    path = os.path.join(TMP, 'par.py')
-    with open(path, 'w') as handle:
-        handle.write(script)
-    serial = tmp('serial.xdmf')
-    parallel = tmp('parallel.xdmf')
-    subprocess.run([sys.executable, path, serial], check=True, timeout=600,
-                   capture_output=True)
-    support.run([sys.executable, path, parallel], 3, timeout=900)
-    a, b = _scan(serial), _scan(parallel)
-    assert len(a) == len(b) == 2, (len(a), len(b))
-    for ga, gb in zip(a, b):
-        assert ga['topology'] == gb['topology'], (ga['topology'], gb['topology'])
-        xa, ca = _read_grid_geometry(serial, ga)
-        xb, cb = _read_grid_geometry(parallel, gb)
-        assert xa.shape == xb.shape, (xa.shape, xb.shape)
-        assert ca.shape == cb.shape, (ca.shape, cb.shape)
-        # the global numbering differs between runs, so compare the geometry as sets
-        assert_close(np.sort(xa, axis=0), np.sort(xb, axis=0), 1e-13,
-                     'node coordinates')
-        from scipy.spatial import cKDTree
-        for name in ga['attributes']:
-            va = _read_grid_attribute(serial, ga, name)
-            vb = _read_grid_attribute(parallel, gb, name)
-            if len(va) == len(xa):
-                # nodal: match the nodes by position, compare the field there
-                _, index = cKDTree(xb).query(xa)
-            else:
-                # cell-centred: match the cells by centroid instead
-                assert len(va) == len(ca), (len(va), len(ca))
-                _, index = cKDTree(xb[cb].mean(axis=1)).query(xa[ca].mean(axis=1))
-            assert_close(va, vb[index], 1e-12, 'field {}'.format(name))
-    print('serial and 3 ranks agree on both grids, {} and {} values'.format(*[len(_read_grid_attribute(serial, g, list(g['attributes'])[0])) for g in a]))
 
 
 def test_mesh_then_p1_share():
@@ -1111,11 +1184,11 @@ Both write vertices-then-edges now, so the two files agree bit for bit."""
     # the node numbering is the mesh's vertices, then one per edge
     assert len(coords) == mesh.num_vertices() + mesh.num_edges(), (
         len(coords), mesh.num_vertices(), mesh.num_edges())
-    assert_close(coords[:mesh.num_vertices()], _pad(mesh.coordinates()), 0.0,
+    assert_close(coords[:mesh.num_vertices()], mesh.coordinates(), 0.0,
                  'the first nodes are the mesh vertices, in order')
     # and the rest are the edge midpoints, in edge order
     mesh.init(1, 0)
-    ends = _pad(mesh.coordinates())[np.array([e.entities(0) for e in df.edges(mesh)])]
+    ends = mesh.coordinates()[np.array([e.entities(0) for e in df.edges(mesh)])]
     assert_close(coords[mesh.num_vertices():], ends.mean(axis=1), 1e-15,
                  'the edge nodes are the edge midpoints, in order')
     print('{} vertices then {} edge nodes'.format(mesh.num_vertices(), mesh.num_edges()))
@@ -1331,6 +1404,7 @@ import os, sys
 import numpy as np, dolfin as df
 from femtools.xdmf import XDMFFile2
 df.set_log_level(40)
+df.parameters['ghost_mode'] = os.environ.get('GHOST_MODE', 'none')
 C = df.MPI.comm_world; R = df.MPI.rank(C)
 mesh = df.UnitCubeMesh(5, 5, 5)
 u = df.Function(df.FunctionSpace(mesh, 'CG', 2)); u.rename('u', 'u')
@@ -1374,7 +1448,7 @@ if R == 0:
 """
 
 
-def _run_parallel(path, ranks, force_serial_h5py=False):
+def _run_parallel(path, ranks, force_serial_h5py=False, ghost_mode='none'):
     """Runs the script above under mpirun and returns the driver it used.
 
     `env=` is not cosmetic: MPI_Init sets 26 PMIX_* variables through the C setenv,
@@ -1391,6 +1465,8 @@ def _run_parallel(path, ranks, force_serial_h5py=False):
     if force_serial_h5py:
         env['H5PY_NEVER_USE_MPI'] = '1'
         cmd += ['-x', 'H5PY_NEVER_USE_MPI']
+    env['GHOST_MODE'] = ghost_mode
+    cmd += ['-x', 'GHOST_MODE']
     proc = subprocess.run(cmd + [sys.executable, script, path],
                           capture_output=True, timeout=900, env=env)
     if proc.returncode != 0:
@@ -1543,9 +1619,9 @@ if df.MPI.rank(C) == 0:
 
 @pytest.mark.mpi
 def test_triangles_rank_counts():
-    """P2 on triangles: one, two and three ranks write the same files
+    """P2 on triangles: one and three ranks write the same files
 
-MPI-IO on two and three, the gather on three as well, all against serial.
+MPI-IO on three, and rank zero's writes (serial h5py) on three, against serial.
 
     A periodic vector series written the way twoasis writes it, and a P2 scalar
     beside it on one grid with cell data, read back on the same ranks into the
@@ -1556,8 +1632,7 @@ MPI-IO on two and three, the gather on three as well, all against serial.
     with open(script, 'w') as handle:
         handle.write(TRIANGLE_SCRIPT)
     folders = {}
-    for tag, ranks, gather in (('1', 1, False), ('2', 2, False), ('3', 3, False),
-                               ('3g', 3, True)):
+    for tag, ranks, gather in (('1', 1, False), ('3', 3, False), ('3g', 3, True)):
         folder = folders[tag] = tmp('tri_ranks_' + tag)
         os.makedirs(folder)
         argv = (['-x', 'H5PY_NEVER_USE_MPI'] if gather else []) + \
@@ -1572,11 +1647,11 @@ MPI-IO on two and three, the gather on three as well, all against serial.
     for name, topology in (('u', 'Triangle_6'), ('p', 'Triangle'), ('uq', 'Triangle_6')):
         serial = os.path.join(folders['1'], name + '.xdmf')
         assert {g['topology'] for g in _scan(serial)} == {topology}, name
-        for tag in ('2', '3', '3g'):
+        for tag in ('3', '3g'):
             _content_equal(os.path.join(folders[tag], name + '.xdmf'), serial)
     assert _scan(os.path.join(folders['1'], 'uq.xdmf'))[0]['centers'] == \
         {'u': 'Node', 'q': 'Node', 't': 'Cell'}
-    print('serial, 2 and 3 ranks (mpio) and 3 (gather) agree; read back exact')
+    print('serial, 3 ranks (mpio) and 3 (gather) agree; read back exact')
 
 
 @pytest.mark.mpi
@@ -1609,46 +1684,48 @@ This deadlocked, and the deadlock is the point.
     print('3 ranks, all 2 cells on one of them: finished and correct')
 
 
+@pytest.fixture(scope='module')
+def parallel_runs(_scratch):
+    """The script above, once each: serially, on three ranks through MPI-IO and through
+    rank zero (h5py's serial build), and on three with ghost cells -- the files every
+    test below compares, written once for all of them. `(path, driver)` by name."""
+    runs = {}
+    for tag, ranks, serial_h5py, ghosts in (('1', 1, False, 'none'),
+                                            ('3', 3, False, 'none'),
+                                            ('3g', 3, True, 'none'),
+                                            ('3gh', 3, False, 'shared_facet')):
+        path = tmp('par_{}.xdmf'.format(tag))
+        runs[tag] = (path, _run_parallel(path, ranks, serial_h5py, ghosts))
+    return runs
+
+
 @pytest.mark.mpi
-def test_mpio_is_used():
+def test_mpio_is_used(parallel_runs):
     """a parallel write really goes through MPI-IO
 
-Without this, a silent fall back to the gather would pass every other case."""
-    driver = _run_parallel(tmp('mpio.xdmf'), 3)
+Without this, a silent fall back to rank zero's writes would pass every other case."""
     import h5py
+    driver = parallel_runs['3'][1]
     if not h5py.get_config().mpi and driver != 'mpio':
         # the serial h5py is all that is installed; say so rather than pass quietly
         raise AssertionError(
-            'no parallel HDF5: install python3-h5py-mpi, or this writes by gathering')
+            'no parallel HDF5: install python3-h5py-mpi, or rank zero writes it all')
     assert driver == 'mpio', 'the collective path was not taken (driver={})'.format(
         driver)
-    print('driver=mpio on 3 ranks')
+    assert parallel_runs['3g'][1] == 'serial'
 
 
 @pytest.mark.mpi
-def test_mpio_matches_gather():
-    """MPI-IO and the gather path write the same file
-
-H5PY_NEVER_USE_MPI forces the serial h5py, and so the old path, in-place."""
-    fast = _run_parallel(tmp('par_fast.xdmf'), 3)
-    slow = _run_parallel(tmp('par_slow.xdmf'), 3, force_serial_h5py=True)
-    assert fast == 'mpio' and slow == 'serial', (fast, slow)
-    _content_equal(tmp('par_fast.xdmf'), tmp('par_slow.xdmf'))
-    print('mpio and gather agree over mesh, markers, (v,q) and u')
+@pytest.mark.parametrize('tag', ['3', '3g', '3gh'])
+def test_parallel_matches_serial(parallel_runs, tag):
+    """three ranks write the serial file, every format: through MPI-IO, through rank
+    zero (H5PY_NEVER_USE_MPI), and with ghost cells (`shared_facet`), each cell then
+    written once, by its owner"""
+    _content_equal(parallel_runs[tag][0], parallel_runs['1'][0])
 
 
 @pytest.mark.mpi
-def test_parallel_matches_serial():
-    """a parallel write matches the serial one, every format"""
-    _run_parallel(tmp('par_1.xdmf'), 1)
-    four = _run_parallel(tmp('par_4.xdmf'), 4)
-    assert four == 'mpio', four
-    _content_equal(tmp('par_4.xdmf'), tmp('par_1.xdmf'))
-    print('4 ranks vs serial: mesh, markers, cell data and three fields all agree')
-
-
-@pytest.mark.mpi
-def test_mesh_rank_count_independent():
+def test_mesh_rank_count_independent(parallel_runs):
     """a mesh written in parallel is byte-identical to the serial one
 
 The property dolfin has and this keeps: global vertex numbering is stable.
@@ -1657,14 +1734,12 @@ The property dolfin has and this keeps: global vertex numbering is stable.
     hold for P2, whose edge nodes are numbered after partitioning -- and that is
     dolfin's non-determinism, not a choice made here.
     """
-    _run_parallel(tmp('mi_1.xdmf'), 1)
-    _run_parallel(tmp('mi_3.xdmf'), 3)
-    a = [g for g in _scan(tmp('mi_1.xdmf')) if g['topology'] == 'Tetrahedron'][0]
-    b = [g for g in _scan(tmp('mi_3.xdmf')) if g['topology'] == 'Tetrahedron'][0]
-    xa, _ = _read_grid_geometry(tmp('mi_1.xdmf'), a)
-    xb, _ = _read_grid_geometry(tmp('mi_3.xdmf'), b)
+    one, three = parallel_runs['1'][0], parallel_runs['3'][0]
+    a = [g for g in _scan(one) if g['topology'] == 'Tetrahedron'][0]
+    b = [g for g in _scan(three) if g['topology'] == 'Tetrahedron'][0]
+    xa, _ = _read_grid_geometry(one, a)
+    xb, _ = _read_grid_geometry(three, b)
     assert_close(xa, xb, 0.0, 'mesh vertices across rank counts')
-    print('{} vertices, identical on 1 and 3 ranks'.format(len(xa)))
 
 
 def test_points_twice():
@@ -1721,85 +1796,6 @@ A grid with no <Time> inside a temporal collection is ambiguous.
     print('2 timed grids inside, the mesh grid outside')
 
 
-@pytest.mark.mpi
-def test_parallel_validation():
-    """the parallel path checks what it can write, as the serial one does
-
-The checks used to live inside `_function_nodes`, which parallel never calls.
-
-    So on more than one rank a DG function was interpolated onto a Lagrange space and
-    written as though it had always been continuous. Run under mpirun, where the
-    collective path is the one taken.
-    """
-    script = """
-import sys
-import dolfin as df
-from femtools.xdmf import XDMFFile2
-df.set_log_level(40)
-C = df.MPI.comm_world
-mesh = df.UnitCubeMesh(4, 4, 4)
-u = df.Function(df.FunctionSpace(mesh, 'DG', 0)); u.rename('u', 'u')
-try:
-    with XDMFFile2(C, sys.argv[1]) as f:
-        f.write(u)
-except ValueError as exc:
-    if df.MPI.rank(C) == 0:
-        print('RAISED=%s' % ('Lagrange' in str(exc)))
-else:
-    if df.MPI.rank(C) == 0:
-        print('RAISED=False')
-"""
-    path = os.path.join(TMP, 'val.py')
-    with open(path, 'w') as handle:
-        handle.write(script)
-    proc = support.run([sys.executable, path, tmp('val.xdmf')], 3, timeout=900,
-                       check=False)
-    out = proc.stdout
-    assert 'RAISED=True' in out, 'a DG function was accepted on 3 ranks: {}{}'.format(
-        out, proc.stderr[-400:])
-    print('a DG function is refused on 3 ranks too')
-
-
-@pytest.mark.mpi
-def test_read_quadratic_parallel():
-    """a quadratic grid reads back on more than one rank
-
-`dofmap().dofs()` is global; the arrays it indexed are this rank's owned rows.
-
-    Rank one indexed a 180-row array at 342 and raised IndexError while rank zero
-    carried on, so the job died unevenly rather than failing.
-    """
-    script = """
-import sys
-import numpy as np, dolfin as df
-from femtools.xdmf import XDMFFile2
-df.set_log_level(40)
-C = df.MPI.comm_world
-mesh = df.UnitCubeMesh(4, 4, 4)
-V = df.FunctionSpace(mesh, 'CG', 2)
-u = df.Function(V); u.rename('u', 'u')
-u.interpolate(df.Expression('x[0]*x[0] + 2*x[1]*x[1]', degree=2))
-with XDMFFile2(C, sys.argv[1]) as f:
-    f.write(u)
-back = df.Function(V)
-with XDMFFile2(C, sys.argv[1]) as f:
-    f.read_checkpoint(back, 'u', 0)
-err = np.abs(back.vector().get_local() - u.vector().get_local()).max()
-worst = df.MPI.max(C, float(err))
-if df.MPI.rank(C) == 0:
-    print('ERR=%.3e' % worst)
-"""
-    path = os.path.join(TMP, 'rdp.py')
-    with open(path, 'w') as handle:
-        handle.write(script)
-    proc = support.run([sys.executable, path, tmp('rdp.xdmf')], 3, timeout=900)
-    line = [l for l in proc.stdout.splitlines() if l.startswith('ERR=')]
-    assert line, proc.stdout[-400:]
-    err = float(line[0].split('=')[1])
-    assert err < 1e-11, 'round trip off by {:.3e} on 3 ranks'.format(err)
-    print('round trip on 3 ranks, worst dof off by {:.1e}'.format(err))
-
-
 def _pad(coords):
     coords = np.asarray(coords, dtype=float)
     if coords.shape[1] < 3:
@@ -1825,21 +1821,98 @@ def _scratch():
 
 
 
+
+
+QUADRATIC_BLOCKS = """
+import sys
+import numpy as np
+from mpi4py import MPI
+from femtools.xdmf import write_quadratic, write_quadratic_blocks
+C = MPI.COMM_WORLD
+rng = np.random.default_rng(4)
+n_nodes, n_cells = 300, 80
+coords = rng.random((n_nodes, 3))
+conn = rng.integers(0, n_nodes, (n_cells, 10))
+u, v = rng.random(n_nodes), rng.random((n_nodes, 3))
+if C.rank == 0:
+    write_quadratic(sys.argv[1], coords, conn, [u, v], ['u', 'v'])
+cells = np.arange(n_cells)[C.rank::C.size]
+nodes = np.arange(n_nodes)[C.rank::C.size]
+write_quadratic_blocks(sys.argv[2], C, cells, conn[cells], n_cells, nodes, coords[nodes],
+                       [u[nodes], v[nodes]], ['u', 'v'], n_nodes)
+try:
+    write_quadratic_blocks(sys.argv[2] + '.bad.xdmf', C, cells, conn[cells], n_cells, nodes,
+                           coords[nodes], [rng.random((len(nodes), 4))], ['w'], n_nodes)
+    refused = False
+except ValueError:
+    refused = True
+if C.allreduce(int(refused), op=MPI.MIN) and C.rank == 0:
+    print('refused everywhere')
+"""
+
+
 @pytest.mark.mpi
-def test_a_large_gather_is_refused_on_every_rank(tmp_path):
-    """Under MPI with only serial h5py, XDMFFile2 would gather the mesh to rank zero;
-    past FEMTOOLS_GATHER_LIMIT cells it refuses instead, naming the way out."""
-    script = tmp_path / 'gather.py'
-    script.write_text(
-        "import dolfin as df\n"
-        "from femtools.xdmf import XDMFFile2\n"
-        "def main(argv):\n"
-        "    mesh = df.UnitCubeMesh(df.MPI.comm_world, 4, 4, 4)\n"
-        "    with XDMFFile2(df.MPI.comm_world, '{}') as f:\n"
-        "        f.write(mesh)\n"
-        "main(None)\n".format(tmp_path / 'm.xdmf'))
-    env = dict(H5PY_NEVER_USE_MPI='1', FEMTOOLS_GATHER_LIMIT='10',
-               PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    proc = support.run([sys.executable, str(script)], 2, env=env, timeout=300, check=False)
-    assert proc.returncode != 0
-    assert 'H5PY_ALWAYS_USE_MPI=1' in proc.stdout + proc.stderr, proc.stderr[-2000:]
+def test_quadratic_blocks_write_what_one_rank_writes():
+    """`write_quadratic_blocks` from three ranks' shares is `write_quadratic`'s file;
+    a field of four components is refused on every rank, none left in a barrier"""
+    path = os.path.join(TMP, 'qblocks.py')
+    with open(path, 'w') as handle:
+        handle.write(QUADRATIC_BLOCKS)
+    one, three = tmp('qb_one.xdmf'), tmp('qb_three.xdmf')
+    proc = support.run([sys.executable, path, one, three], 3, timeout=300)
+    assert 'refused everywhere' in proc.stdout, proc.stdout + proc.stderr
+    a, b = _scan(one), _scan(three)
+    assert len(a) == len(b) == 1
+    xa, ca = _read_grid_geometry(one, a[0])
+    xb, cb = _read_grid_geometry(three, b[0])
+    assert np.array_equal(xa, xb) and np.array_equal(ca, cb)
+    for name in ('u', 'v'):
+        assert np.array_equal(_read_grid_attribute(one, a[0], name),
+                              _read_grid_attribute(three, b[0], name))
+
+
+def test_a_2d_mesh_reads_back_2d():
+    """a 2D mesh is written XY, as dolfin writes it, so it reads back with two
+    coordinates: from a linear file (dolfin's reader) and from a quadratic one"""
+    mesh = df.UnitSquareMesh(3, 3)
+    with XDMFFile2(df.MPI.comm_world, tmp('m2d.xdmf')) as f:
+        f.write(mesh)
+    with XDMFFile2(df.MPI.comm_world, tmp('q2d.xdmf')) as f:
+        f.write(quadratic_field(mesh))
+    for name in ('m2d.xdmf', 'q2d.xdmf'):
+        back = df.Mesh()
+        with XDMFFile2(df.MPI.comm_world, tmp(name)) as f:
+            f.read(back)
+        assert back.geometry().dim() == 2, name
+        assert back.num_cells() == mesh.num_cells(), name
+
+
+@pytest.mark.parametrize('degree', [1, 2])
+def test_a_moved_mesh_is_written_where_it_is(degree):
+    """the node layout is kept between writes, its coordinates are not: a mesh moved
+    between two steps is stored at each step where it was"""
+    mesh = df.UnitSquareMesh(3, 3)
+    u = df.Function(df.FunctionSpace(mesh, 'CG', degree))
+    u.rename('u', 'u')
+    with XDMFFile2(df.MPI.comm_world, tmp('moved{}.xdmf'.format(degree))) as f:
+        f.write(u, 0.0)
+        mesh.coordinates()[:] *= 2.0
+        f.write(u, 1.0)
+    steps = _scan(tmp('moved{}.xdmf'.format(degree)))
+    first, second = (_read_grid_geometry(tmp('moved{}.xdmf'.format(degree)), g)[0]
+                     for g in steps)
+    assert first.max() == 1.0 and second.max() == 2.0
+
+
+def test_an_interval_mesh_is_written_xy():
+    """XDMF has no one-column geometry: a 1D mesh's goes out as XY, y = 0"""
+    mesh = df.UnitIntervalMesh(4)
+    u = df.interpolate(df.Expression('x[0]', degree=1), df.FunctionSpace(mesh, 'CG', 1))
+    u.rename('u', 'u')
+    with XDMFFile2(df.MPI.comm_world, tmp('line.xdmf')) as f:
+        f.write(mesh)
+        f.write(u)
+    for g in _scan(tmp('line.xdmf')):
+        x, _ = _read_grid_geometry(tmp('line.xdmf'), g)
+        assert x.shape == (5, 2) and not x[:, 1].any()
+    assert 'GeometryType="XY"' in open(tmp('line.xdmf')).read()

@@ -21,14 +21,38 @@ from tests import support  # noqa: E402
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dolfin_layout_worker.py")
 
 
+#: h5py's builds, as Debian picks them: the MPI one writes through MPI-IO, every rank its
+#: own block; the serial one through rank zero (the fallback)
+H5PY = {"mpio": {"H5PY_ALWAYS_USE_MPI": "1"}, "gather": {"H5PY_NEVER_USE_MPI": "1"}}
+LINKED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dolfin_layout_linked_worker.py")
+
+
 @pytest.mark.mpi
-@pytest.mark.parametrize("ranks", [1, 3])
-def test_the_same_file_as_dolfin_writes_but_compressed(ranks, tmp_path):
-    out = str(tmp_path)
-    proc = support.run([sys.executable, WORKER, out], ranks, timeout=600)
+@pytest.mark.parametrize("ranks,h5py_build", [(1, None), (3, "mpio"), (3, "gather")])
+def test_the_same_file_as_dolfin_writes_but_compressed(ranks, h5py_build, tmp_path):
+    """the file dolfin writes, compressed, on one rank and on three either way h5py
+    writes, and dolfin reads it back"""
+    proc = support.run([sys.executable, WORKER, str(tmp_path)], ranks, timeout=600,
+                       env=H5PY.get(h5py_build))
     lines = proc.stdout.strip().splitlines()
     assert lines and all(line.endswith(": same") for line in lines), proc.stdout
     assert len(lines) == 2 + 3 + 1 + 2 * 5, proc.stdout     # groups and datasets
+
+
+@pytest.mark.mpi
+def test_tables_written_once_and_linked(tmp_path):
+    """`write_dofs` once, `write_function(..., dofs=...)` per vector: dolfin reads each
+    group back exactly, from a copied folder too; tables of another element, of
+    another number of ranks, or in the Function's own file, are refused. (Both ways
+    h5py writes are `write_ordered`'s, tested in test_compress.)"""
+    def run(ranks, *args):
+        proc = support.run([sys.executable, LINKED, str(tmp_path)] + list(args), ranks,
+                           timeout=600)
+        return proc.stdout.strip().splitlines()[1:]
+    run(1, "tables")
+    assert run(3, "link", "tables_1.h5") == [
+        "read back: same", "read back moved: same", "other element: refused",
+        "own file: refused", "numbering: refused"]
 
 
 @pytest.mark.parametrize("dim", [2, 3])

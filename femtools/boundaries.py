@@ -53,7 +53,9 @@ def write(path, points, facets, markers, comm=None):
     points = np.asarray(points, dtype=np.float64)
     facets, markers = np.asarray(facets), np.asarray(markers, dtype=np.int64).ravel()
     size = 1 if comm is None else comm.Get_size()
-    mine = (len(points), len(facets), facets.shape[1], points.shape[1])
+    # an empty block may be 1-D: its width is any other rank's
+    mine = (len(points), len(facets), facets.shape[1] if facets.ndim == 2 else 0,
+            points.shape[1] if points.ndim == 2 else 0)
     shares = np.array([mine] if size == 1 else comm.allgather(mine), dtype=np.int64)
     n_points, n_facets = (int(v) for v in shares[:, :2].sum(axis=0))
     nv, gd = (int(v) for v in shares[:, 2:].max(axis=0))

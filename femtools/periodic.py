@@ -2,7 +2,9 @@
 
     PeriodicBox(upper, tol, periodic, lower)    a SubDomain identifying opposite faces
     periodic_box(upper, tol, periodic, lower)   the same pairing, compiled
-    faces_congruent(mesh, L, axes)              whether identified faces carry the same nodes
+    faces_congruent(mesh, L, axes, lower=...)   whether identified faces carry the same nodes
+    extent(mesh)                                the mesh's bounding box, over its ranks
+    box_lower(mesh, axes, lower)                a box's lower corner, checked against the mesh
     cell_dofs(dofmap, cells, n)                 the first n dofs of many cells, one call
     connectivity(mesh, d0, d1)                  a topology connectivity as one array
 
@@ -191,15 +193,46 @@ def connectivity(mesh, d0, d1):
 
 def periodic_box(upper, tol=df.DOLFIN_EPS_LARGE, periodic=None, lower=None, map_tol=None):
     """`PeriodicBox`, compiled: the same pairing without a pybind crossing per call.
-    Carries `lower`, `upper` and `periodic` as attributes, as `PeriodicBox` does."""
+    Carries `lower`, `upper`, `periodic` and `tol` as attributes, as `PeriodicBox` does
+    (`tol` for the repair and the pairing check to judge the same nodes on a face)."""
     lower, upper, periodic = _box(upper, periodic, lower)
     box = _module().CppPeriodicBox(lower, upper, periodic, float(tol),
                                    float(tol if map_tol is None else map_tol))
-    box.lower, box.upper, box.periodic = lower, upper, periodic
+    box.lower, box.upper, box.periodic, box.tol = lower, upper, periodic, float(tol)
     return box
 
 
-def faces_congruent(mesh, L, axes, tol=1e-9, edges=False, exempt=None):
+def xyz(a):
+    """Coordinates, or a corner, padded with zeros to three components."""
+    a = np.asarray(a, dtype=float)
+    pad = [(0, 0)] * (a.ndim - 1) + [(0, 3 - a.shape[-1])]
+    return np.pad(a, pad) if a.shape[-1] < 3 else a
+
+
+def extent(mesh):
+    """`(lower, upper)`: the corners of the mesh's bounding box over all its ranks,
+    `gdim` components each (`hdf5_rows.extent`)."""
+    from femtools import hdf5_rows
+    return hdf5_rows.extent(mesh.coordinates(), mesh.mpi_comm(), mesh.geometry().dim())
+
+
+def box_lower(mesh, axes, lower=None, tol=1e-9):
+    """The periodic box's lower corner, three components: `lower`, or the origin when
+    it is None -- refused, on every rank, when the mesh does not reach the origin along
+    a periodic axis, since a box elsewhere then needs its lower corner given (the
+    upper faces would otherwise be compared with planes inside the mesh). Collective."""
+    if lower is not None:
+        return xyz(lower)
+    lo, hi = extent(mesh)
+    off = [a for a in axes if abs(lo[a]) > tol * max(1.0, abs(hi[a] - lo[a]))]
+    if off:
+        raise ValueError(
+            "the mesh starts at {} along periodic axis {}, not at 0: give the box's "
+            "lower corner (lower=)".format(lo[off[0]], off[0]))
+    return np.zeros(3)
+
+
+def faces_congruent(mesh, L, axes, tol=1e-9, edges=False, exempt=None, lower=None):
     """Whether the faces identified along `axes` still carry the same nodes.
 
     Returns `(ok, axis, n_lo, n_hi)`; on failure `axis` is the first one that does
@@ -210,7 +243,9 @@ def faces_congruent(mesh, L, axes, tol=1e-9, edges=False, exempt=None):
     is missing is simply left unconstrained -- dolfin builds the space, the solve
     runs, and periodicity is quietly gone along that face.
 
-    The box's lower corner is the origin and `L` its upper one. Compared across ranks, never per-rank: after `ParallelRefinement` redistributes, a
+    `L` is the box's upper corner and `lower` its lower one (`box_lower`: the origin
+    when None, which a mesh elsewhere is refused). 2D and 3D. Compared across ranks,
+    never per-rank: after `ParallelRefinement` redistributes, a
     rank's local share need not hold both halves of any pair, so a per-rank answer is
     about the partition rather than the mesh. Each face node goes, by its rounded
     position, to the rank that key hashes to (`hdf5_rows.route`), where both sides are
@@ -237,27 +272,27 @@ def faces_congruent(mesh, L, axes, tol=1e-9, edges=False, exempt=None):
     compared as always.
     """
     comm = mesh.mpi_comm()
-    x = mesh.coordinates()
+    # the box moved to the origin, in three components
+    lower = box_lower(mesh, axes, lower)
+    L = xyz(L) - lower
+    x = xyz(mesh.coordinates()) - lower
     # only the nodes on an identified plane are compared, or looked up among the exempt
     # positions: those are taken first, the vertices then the edges in their own order,
     # each midpoint's coordinate along an axis computed as the whole midpoint would be,
     # so every comparison below sees the rows it saw when every node was built and
     # matched
-    on_v = _on_planes(x, L, axes, tol)
+    on_v = on_planes(x, np.zeros(3), L, axes, tol)
     pts, keep = x[on_v], [np.nonzero(on_v)[0]]
     n_nodes = len(x)
     if edges:
         e = connectivity(mesh, 1, 0)
-        on_e = np.zeros(len(e), bool)
-        for a in axes:
-            m = 0.5 * (x[e[:, 0], a] + x[e[:, 1], a])
-            on_e |= (np.abs(m) < tol) | (np.abs(m - L[a]) < tol)
-        k = np.nonzero(on_e)[0]
+        k = np.nonzero(on_planes(0.5 * (x[e[:, 0]] + x[e[:, 1]]), np.zeros(3), L, axes,
+                                 tol))[0]
         pts = np.vstack((pts, 0.5 * (x[e[k, 0]] + x[e[k, 1]])))
         keep.append(len(x) + k)
         n_nodes += len(e)
     if exempt is not None and np.asarray(exempt).ndim == 2:
-        exempt = _at_positions(pts, np.asarray(exempt, float), tol)
+        exempt = _at_positions(pts, xyz(exempt) - lower, tol)
     elif exempt is not None:
         exempt = np.asarray(exempt, bool)
         if len(exempt) != n_nodes:
@@ -277,11 +312,12 @@ def faces_congruent(mesh, L, axes, tol=1e-9, edges=False, exempt=None):
     return True, None, 0, 0
 
 
-def _on_planes(x, L, axes, tol):
-    """Which rows of `x` lie within `tol` of an identified plane, 0 or L[a], of `axes`."""
-    on = np.zeros(len(x), bool)
+def on_planes(x, lower, upper, axes, tol):
+    """Which points of `x` (coordinates along the last axis) lie within `tol` of an
+    identified plane, lower[a] or upper[a], of `axes`."""
+    on = np.zeros(np.shape(x)[:-1], bool)
     for a in axes:
-        on |= (np.abs(x[:, a]) < tol) | (np.abs(x[:, a] - L[a]) < tol)
+        on |= (np.abs(x[..., a] - lower[a]) < tol) | (np.abs(x[..., a] - upper[a]) < tol)
     return on
 
 
@@ -291,17 +327,14 @@ def _compare_sides(comm, lo, hi, a, L, tol, ex_lo=None, ex_hi=None):
     side and not exempt. Each node goes by its rounded position to the rank its key
     hashes to, which deduplicates and compares; the counts are summed. Collective."""
     from mpi4py import MPI
-    from femtools.hdf5_rows import route
+    from femtools.hdf5_rows import find_rows, rank_of, route
     hi = np.array(hi, float).reshape(-1, 3)
     hi[:, a] -= L[a]
     keys = np.round(np.vstack([np.reshape(lo, (-1, 3)), hi]) / tol).astype(np.int64)
     side = np.r_[np.zeros(len(lo), np.int64), np.ones(len(hi), np.int64)]
     ex = np.zeros(len(keys), np.int64) if ex_lo is None else \
         np.r_[np.asarray(ex_lo, np.int64), np.asarray(ex_hi, np.int64)]
-    k = keys.astype(np.uint64)
-    dest = ((k[:, 0] * np.uint64(0x9E3779B97F4A7C15)) ^ (k[:, 1] * np.uint64(0xC2B2AE3D27D4EB4F))
-            ^ (k[:, 2] * np.uint64(0x165667B19E3779F9))) % np.uint64(comm.Get_size())
-    keys, side, ex = route(comm, dest.astype(np.int64), keys, side, ex).received
+    keys, side, ex = route(comm, rank_of(keys, comm.Get_size()), keys, side, ex).received
     out = np.zeros(4, np.int64)
     sides = []
     for j in (0, 1):
@@ -316,7 +349,7 @@ def _compare_sides(comm, lo, hi, a, L, tol, ex_lo=None, ex_hi=None):
         out[j] = len(u)
     for j in (0, 1):
         (u, ex_u), (other, _) = sides[j], sides[1 - j]
-        out[2 + j] = np.count_nonzero(~_rows_in(u, other) & ~ex_u)
+        out[2 + j] = np.count_nonzero((find_rows(u, other) < 0) & ~ex_u)
     out = comm.allreduce(out, op=MPI.SUM)
     return tuple(int(v) for v in out)
 
@@ -340,14 +373,6 @@ def _at_positions(pts, where, tol):
     """Which of `pts` lie at one of the positions `where`, to `tol`."""
     if not len(pts) or not len(where):
         return np.zeros(len(pts), bool)
-    return _rows_in(np.round(pts / tol).astype(np.int64),
-                    np.unique(np.round(where / tol).astype(np.int64), axis=0))
-
-
-def _rows_in(a, b):
-    """Which rows of `a` (unique int rows) occur among the rows of `b` (unique)."""
-    if not len(b):
-        return np.zeros(len(a), bool)
-    both = np.vstack((b, a))
-    _, inv, counts = np.unique(both, axis=0, return_inverse=True, return_counts=True)
-    return counts[inv.reshape(-1)[len(b):]] > 1
+    from femtools.hdf5_rows import find_rows, unique_rows
+    return find_rows(np.round(pts / tol).astype(np.int64),
+                     unique_rows(np.round(where / tol).astype(np.int64))) >= 0

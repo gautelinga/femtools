@@ -2,16 +2,17 @@
 
     compress.put(h5, name, a)                                          # any serial writer
     hdf5_rows.write_ordered(...)                                       # rows from many ranks
-    compress.rewrite(path)          # a file other code wrote, compressed in place
+    compress.rewrite(path[, comm])  # a file other code wrote, compressed in place
 
 numpy and h5py only. Readers need nothing: h5py, dolfin's HDF5File and ParaView decode
 gzip in the HDF5 library itself.
 
-Under MPI the compression is spread over the ranks: `encode` turns a rank's block of whole
-chunks into the bytes HDF5 would store (shuffle, then a zlib stream), and rank zero writes
-them as they are (`write_direct_chunk`), so it only moves bytes. A block must start on a
-chunk boundary (`aligned_edges`); HDF5 stores a dataset's last, partial chunk at full size,
-so it is padded with zeros, the fill value.
+Under MPI every rank writes its own block of whole chunks (`aligned_edges`), collectively
+through MPI-IO, and HDF5 compresses each rank's chunks. Without h5py's MPI build the
+compression is still spread over the ranks: `encode` turns a rank's block into the bytes
+HDF5 would store (shuffle, then a zlib stream), and rank zero writes them as they are
+(`write_direct_chunk`), so it only moves bytes. HDF5 stores a dataset's last, partial chunk
+at full size, so it is padded with zeros, the fill value.
 """
 import zlib
 
@@ -78,19 +79,33 @@ WORTH_SHARE = 0.01
 
 
 def _walk(g, out):
-    """Every group and dataset under g, in order; refuses links and anything else."""
+    """Every group, dataset and link under g, in order: `("g", name)`, `("d", name)`, or
+    `("l", name, target)` for a soft or external link, kept as it is and not followed
+    (`target` is `("soft", path)` or `("external", file, path)`). Refuses anything else."""
     import h5py
-    for k, v in g.items():
-        if not isinstance(g.get(k, getlink=True), h5py.HardLink):
-            raise ValueError("{}/{} is a link".format(g.name, k))
+    for k in g.keys():
+        name = g.name.rstrip("/") + "/" + k
+        link = g.get(k, getlink=True)
+        if isinstance(link, h5py.SoftLink):
+            out.append(("l", name, ("soft", link.path)))
+            continue
+        if isinstance(link, h5py.ExternalLink):
+            out.append(("l", name, ("external", link.filename, link.path)))
+            continue
+        v = g[k]
         if isinstance(v, h5py.Group):
-            out.append(("g", v.name))
+            out.append(("g", name))
             _walk(v, out)
         elif isinstance(v, h5py.Dataset):
-            out.append(("d", v.name))
+            out.append(("d", name))
         else:
-            raise ValueError("{} is a {}".format(v.name, type(v).__name__))
+            raise ValueError("{} is a {}".format(name, type(v).__name__))
     return out
+
+
+def _link(target):
+    import h5py
+    return h5py.SoftLink(target[1]) if target[0] == "soft" else h5py.ExternalLink(*target[1:])
 
 
 def _filtered(d):
@@ -108,19 +123,35 @@ def _raw(d):
     return _filtered(d) and d.chunks is not None and hasattr(d.id, "get_num_chunks")
 
 
-def _rows(d):
+def _pieces(d, comm=None, pad=False):
+    """Row slices of d of at most about `BLOCK` values: all of its rows serially, under
+    MPI this rank's block of whole chunks (`aligned_edges`). With `pad`, as many on every
+    rank (empty ones added), since a collective write takes every rank once a slice."""
     width = int(np.prod(d.shape[1:])) if d.ndim > 1 else 1
-    step = max(1, BLOCK // max(width, 1))
-    for lo in range(0, d.shape[0], step):
-        yield slice(lo, min(d.shape[0], lo + step))
+    rows = d.chunks[0] if d.chunks else 1
+    step = max(rows, (BLOCK // max(width, 1)) // rows * rows)
+    lo, hi = 0, d.shape[0]
+    if comm is not None:
+        edges = aligned_edges(d.shape[0], comm.Get_size(), rows)
+        lo, hi = int(edges[comm.Get_rank()]), int(edges[comm.Get_rank() + 1])
+    mine = [slice(a, min(hi, a + step)) for a in range(lo, hi, step)]
+    if pad and comm is not None:
+        from femtools.hdf5_rows import allreduce
+        mine += [slice(hi, hi)] * (allreduce(comm, len(mine), "max") - len(mine))
+    return mine
+
+
+def _chunk(d, i):
+    """`(offset, filter mask, stored bytes)` of the i-th stored chunk."""
+    at = d.id.get_chunk_info(i).chunk_offset
+    mask, data = d.id.read_direct_chunk(at)
+    return at, mask, data
 
 
 def _chunks(d):
-    """`(offset, filter mask, stored bytes)` of every stored chunk, in storage order."""
+    """`_chunk` of every stored chunk, in storage order."""
     for i in range(d.id.get_num_chunks()):
-        at = d.id.get_chunk_info(i).chunk_offset
-        mask, data = d.id.read_direct_chunk(at)
-        yield at, mask, data
+        yield _chunk(d, i)
 
 
 def _same_attrs(a, b):
@@ -141,110 +172,229 @@ def _same_attrs(a, b):
     return True
 
 
-def _copy(src, dst):
-    """`(names, plain bytes)`; dst written only when the plain bytes are worth it."""
-    import os
+def _survey(src):
+    """`(names, plain bytes, variable-length data)` of src, read only."""
     import h5py
     with h5py.File(src, "r") as fi:
         names = _walk(fi, [])
-        plain = sum(fi[n].size * fi[n].dtype.itemsize for kind, n in names
-                    if kind == "d" and _plain(fi[n]))
-        if plain < max(WORTH_BYTES, WORTH_SHARE * os.path.getsize(src)):
-            return None, plain
-        with h5py.File(dst, "w", rdcc_nbytes=64 << 20, rdcc_nslots=10007) as fo:
+        datasets = [fi[n] for kind, n, *_ in names if kind == "d"]
+        plain = sum(d.size * d.dtype.itemsize for d in datasets if _plain(d))
+        vlen = any(d.dtype.kind == "O" for d in datasets)
+    return names, plain, vlen
+
+
+def _create(fo, n, d):
+    """Dataset n of fo for src's dataset d: compressed (`options`) if plain, else created
+    as it was -- layout, filters, fill value, maxshape."""
+    import h5py
+    if _plain(d):
+        return fo.create_dataset(n, shape=d.shape, dtype=d.dtype, maxshape=d.maxshape,
+                                 fillvalue=d.fillvalue, **options(d.shape))
+    return h5py.Dataset(h5py.h5d.create(fo.id, n.encode(), d.id.get_type(), d.id.get_space(),
+                                        dcpl=d.id.get_create_plist()))
+
+
+def _copy_chunks(fo, fi, names):
+    """The filtered datasets `names` of fi into fo as their stored chunks, with their
+    attributes."""
+    for n in names:
+        d = fi[n]
+        e = _create(fo, n, d)
+        for at, mask, data in _chunks(d):
+            e.id.write_direct_chunk(at, data, mask)
+        for k, v in d.attrs.items():
+            e.attrs[k] = v
+
+
+def _copy(src, dst, names, comm=None):
+    """dst as src, every plain dataset compressed, links kept as links. A filtered
+    dataset HDF5 can list the chunks of is copied as its stored chunks.
+
+    With comm (MPI-IO, every rank): each rank writes its own block of every other
+    dataset's rows, collectively, and HDF5 compresses the chunks. The stored chunks are
+    then copied by rank zero alone, into the closed file reopened serially: HDF5 takes
+    no stored chunks from several ranks at once (it hangs at close)."""
+    import contextlib
+    import os
+    import h5py
+    from femtools.abort import aborting
+    from femtools.hdf5_rows import collective_write
+    rank0 = comm is None or comm.Get_rank() == 0
+    raw = []
+    mpi = {} if comm is None else {"driver": "mpio", "comm": comm}
+
+    def drop():             # by whichever rank failed: the others are held in the write
+        if os.path.exists(dst):
+            os.remove(dst)
+
+    # under MPI-IO a failure aborts the job, the copy removed first: the abort inside
+    # the file, whose collective close would otherwise hold the failing rank
+    collective = (lambda: aborting(comm, drop)) if comm is not None else contextlib.nullcontext
+    with h5py.File(src, "r") as fi:
+        with h5py.File(dst, "w", rdcc_nbytes=64 << 20, rdcc_nslots=10007, **mpi) as fo, \
+                collective():
             for k, v in fi.attrs.items():
                 fo.attrs[k] = v
-            for kind, n in names:
+            for kind, n, *target in names:
+                if kind == "l":
+                    fo[n] = _link(target[0])
+                    continue
                 d = fi[n]
                 if kind == "g":
                     e = fo.create_group(n)
-                elif _plain(d):
-                    e = fo.create_dataset(n, shape=d.shape, dtype=d.dtype, maxshape=d.maxshape,
-                                          fillvalue=d.fillvalue, **options(d.shape))
-                    for s in _rows(d):
-                        e[s] = d[s]
-                else:       # as it was created: layout, filters, fill value, maxshape
-                    e = h5py.Dataset(h5py.h5d.create(fo.id, n.encode(), d.id.get_type(),
-                                                     d.id.get_space(),
-                                                     dcpl=d.id.get_create_plist()))
-                    if _raw(d):
-                        for at, mask, data in _chunks(d):
-                            e.id.write_direct_chunk(at, data, mask)
-                    elif d.size and d.ndim:
-                        for s in _rows(d):
-                            e[s] = d[s]
+                elif _raw(d):
+                    raw.append(n)
+                    if comm is not None:
+                        continue
+                    _copy_chunks(fo, fi, [n])
+                    continue
+                else:
+                    e = _create(fo, n, d)
+                    if d.size and d.ndim:
+                        for s in _pieces(e, comm, pad=True):
+                            if comm is None:
+                                e[s] = d[s]
+                            else:
+                                collective_write(e, s.start, d[s])
                     elif d.size:
                         e[()] = d[()]
                 for k, v in d.attrs.items():
                     e.attrs[k] = v
-    return names, plain
+        if comm is not None and raw:
+            with collective():
+                if rank0:
+                    with h5py.File(dst, "r+") as fo:
+                        _copy_chunks(fo, fi, raw)
+                comm.Barrier()
 
 
-def _check(src, dst, names):
+def _check(src, dst, names, comm=None):
+    """The first difference between src and dst, or None: structure, links, attributes,
+    and every dataset's values, a stored-chunk dataset's stored bytes. With comm, each
+    rank compares its own share of the rows and chunks, and every rank gets the answer."""
     import h5py
+    rank, size = (0, 1) if comm is None else (comm.Get_rank(), comm.Get_size())
+    bad = None
     with h5py.File(src, "r") as fi, h5py.File(dst, "r") as fo:
         if _walk(fo, []) != names or not _same_attrs(fi.attrs, fo.attrs):
-            return "the structure or the file's attributes differ"
-        for kind, n in names:
+            bad = "the structure or the file's attributes differ"
+        for kind, n, *_ in ([] if bad else names):
+            if kind == "l":
+                continue
             d, e = fi[n], fo[n]
             if not _same_attrs(d.attrs, e.attrs):
-                return "{}'s attributes differ".format(n)
-            if kind == "g":
+                bad = "{}'s attributes differ".format(n)
+            elif kind == "g":
                 continue
-            if d.dtype != e.dtype or d.shape != e.shape or d.maxshape != e.maxshape:
-                return "{}: dtype, shape or maxshape differs".format(n)
-            if _raw(d):
-                # chunk by chunk: holding both datasets' stored bytes doubled the peak
-                if d.id.get_num_chunks() != e.id.get_num_chunks() or any(
-                        a != b for a, b in zip(_chunks(d), _chunks(e))):
-                    return "{}: a stored chunk differs".format(n)
-                continue
-            if d.ndim == 0 or d.size == 0:
+            elif d.dtype != e.dtype or d.shape != e.shape or d.maxshape != e.maxshape:
+                bad = "{}: dtype, shape or maxshape differs".format(n)
+            elif _raw(d):
+                if d.id.get_num_chunks() != e.id.get_num_chunks():
+                    bad = "{}: the number of stored chunks differs".format(n)
+                elif any(_chunk(d, i) != _chunk(e, i)
+                         for i in range(rank, d.id.get_num_chunks(), size)):
+                    bad = "{}: a stored chunk differs".format(n)
+            elif d.ndim == 0 or d.size == 0:
                 if np.asarray(d[()]).tobytes() != np.asarray(e[()]).tobytes():
-                    return "{} differs".format(n)
-                continue
-            for s in _rows(d):
-                if np.ascontiguousarray(d[s]).tobytes() != np.ascontiguousarray(e[s]).tobytes():
-                    return "{} differs in rows {}..{}".format(n, s.start, s.stop)
-    return None
+                    bad = "{} differs".format(n)
+            else:
+                for s in _pieces(e, comm):
+                    if (np.ascontiguousarray(d[s]).tobytes()
+                            != np.ascontiguousarray(e[s]).tobytes()):
+                        bad = "{} differs in rows {}..{}".format(n, s.start, s.stop)
+                        break
+            if bad:
+                break
+    if comm is None:
+        return bad
+    found = [b for b in comm.allgather(bad) if b]
+    return found[0] if found else None
 
 
-def rewrite(path):
+def rewrite(path, comm=None, share=None):
     """`path` rewritten with every dataset not yet compressed compressed (`options`), in
     place: written beside it, every dataset and attribute read back from both and compared
     bit for bit, the original's mtime and mode put on the copy, then `os.replace`, so a
     reader meets one file or the other. A plain dataset keeps its maxshape and fill value;
     a filtered one is created as it was and copied as its stored chunks, compared stored
-    byte for stored byte. Skips a symlink, a file with other hard links (the old copy
-    would stay alive), and a file whose plain datasets are under `WORTH_BYTES` or
-    `WORTH_SHARE` of it, so a rerun does nothing. Returns `(code, message)`: 0 rewritten, 1 failed (the original kept),
-    SKIPPED. For files other code writes, and for files written before compression."""
+    byte for stored byte; a soft or external link is kept as the link. Skips a symlink, a
+    file with other hard links (the old copy would stay alive), and a file whose plain
+    datasets are under `WORTH_BYTES` or `WORTH_SHARE` of it, so a rerun does nothing.
+    Returns `(code, message)`: 0 rewritten, 1 failed (the original kept), SKIPPED. For
+    files other code writes, and for files written before compression. `share` replaces
+    `WORTH_SHARE`: a file appended to and rewritten after each append (an XDMF checkpoint
+    at each close) is copied whole each time, so a larger share -- a rewrite once the
+    plain part has grown that much -- keeps the copying a few times the final size.
+
+    With `comm`, collective, and every rank gets the result: through MPI-IO when h5py
+    has it (`hdf5_rows.mpio`), every rank copying and comparing its own share of each
+    dataset; otherwise, or for a file with variable-length data (which parallel HDF5
+    cannot write), by rank zero. A failure while the ranks write together aborts the job
+    (`abort.aborting`), the copy removed."""
+    from femtools.hdf5_rows import mpio
+    share = WORTH_SHARE if share is None else float(share)
+    if mpio(comm):
+        return _rewrite(path, comm, share)
+    if comm is None or comm.Get_size() == 1:
+        return _rewrite(path, None, share)
+    return comm.bcast(_rewrite(path, None, share) if comm.Get_rank() == 0 else None, root=0)
+
+
+def _rewrite(path, comm, share=WORTH_SHARE):
+    """`rewrite` by this process alone (comm None), or by every rank of comm (MPI-IO)."""
     import os
     import time
+    from femtools.abort import aborting
     t = time.time()
     tmp = path + SUFFIX
+    rank0 = comm is None or comm.Get_rank() == 0
     if os.path.islink(path):
         return SKIPPED, "a symlink"
     st = os.stat(path)
     if st.st_nlink > 1:
         return SKIPPED, "{} hard links".format(st.st_nlink)
+    # read only, and alike on every rank: what is refused here is answered, not raised
     try:
-        names, plain = _copy(path, tmp)
-        if names is None:
-            return SKIPPED, ("nothing to compress" if plain == 0 else
-                             "nothing worth compressing ({:.0f} KiB plain)".format(plain / 1024))
-        bad = _check(path, tmp, names)
-        if bad:
-            os.remove(tmp)
-            return 1, "NOT REPLACED: " + bad
+        names, plain, vlen = _survey(path)
+    except Exception as e:                  # noqa: BLE001 -- reported; the original kept
+        return 1, "NOT REPLACED: {}: {}".format(type(e).__name__, e)
+    if plain < max(WORTH_BYTES, share * st.st_size):
+        return SKIPPED, ("nothing to compress" if plain == 0 else
+                         "nothing worth compressing ({:.0f} KiB plain)".format(plain / 1024))
+    if comm is not None and vlen:
+        return comm.bcast(_rewrite(path, None, share) if rank0 else None, root=0)
+
+    def replace():
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         os.chmod(tmp, st.st_mode & 0o7777)
         after = os.path.getsize(tmp)
         os.replace(tmp, path)
-    except Exception as e:                  # noqa: BLE001 -- reported; the original kept
-        if os.path.exists(tmp):
+        return after
+
+    if comm is None:
+        try:
+            _copy(path, tmp, names)
+            bad = _check(path, tmp, names)
+            after = None if bad else replace()
+        except Exception as e:              # noqa: BLE001 -- reported; the original kept
+            bad = "{}: {}".format(type(e).__name__, e)
+        if bad and os.path.exists(tmp):
             os.remove(tmp)
-        return 1, "NOT REPLACED: {}: {}".format(type(e).__name__, e)
+    else:
+        _copy(path, tmp, names, comm)       # aborts by itself, inside its MPI-IO file
+
+        def drop():
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        with aborting(comm, drop):
+            bad = _check(path, tmp, names, comm)
+            after = None if bad or not rank0 else replace()
+            after = comm.bcast(after, root=0)
+        if bad and rank0:
+            os.remove(tmp)
+    if bad:
+        return 1, "NOT REPLACED: " + bad
     return 0, "{:.2f} -> {:.2f} GiB, x{:.2f}, {:.0f} s".format(
         st.st_size / 2**30, after / 2**30, st.st_size / after, time.time() - t)
 

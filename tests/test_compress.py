@@ -139,15 +139,36 @@ def test_rewrite_skips_a_file_with_little_plain(tmp_path):
 
 
 @pytest.mark.mpi
-def test_write_ordered_under_mpi_in_small_messages(tmp_path):
-    """3 ranks, rows scattered and repeated, messages capped at 64 KiB: the file is the
-    array, compressed (tests/compress_worker.py)."""
+@pytest.mark.parametrize("h5py_build", ["mpio", "gather"])
+def test_write_ordered_under_mpi(tmp_path, h5py_build):
+    """3 ranks, rows scattered and repeated: the file is the array, compressed
+    (tests/compress_worker.py) -- every rank writing its block through MPI-IO, or, with
+    h5py's serial build, rank zero writing them all in messages capped at 64 KiB."""
     import sys
     pytest.importorskip("mpi4py")
     from tests import support
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compress_worker.py")
-    proc = support.run([sys.executable, worker, str(tmp_path)], 3, timeout=300)
-    assert proc.stdout.strip().endswith("ok"), proc.stdout + proc.stderr
+    env = {"mpio": {"H5PY_ALWAYS_USE_MPI": "1"}, "gather": {"H5PY_NEVER_USE_MPI": "1"}}
+    proc = support.run([sys.executable, worker, str(tmp_path)], 3, timeout=300,
+                       env=env[h5py_build])
+    assert proc.stdout.strip().splitlines() == [h5py_build, "ok"], proc.stdout + proc.stderr
+
+
+@pytest.mark.mpi
+@pytest.mark.parametrize("h5py_build,vlen", [("mpio", False), ("mpio", True),
+                                             ("gather", False)])
+def test_rewrite_under_mpi(tmp_path, h5py_build, vlen):
+    """3 ranks rewrite a file: through MPI-IO every rank its own blocks, or rank zero
+    alone (h5py's serial build, or a variable-length dataset, which parallel HDF5 cannot
+    write); everything kept, the plain compressed (tests/rewrite_worker.py)."""
+    import sys
+    pytest.importorskip("mpi4py")
+    from tests import support
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rewrite_worker.py")
+    env = {"mpio": {"H5PY_ALWAYS_USE_MPI": "1"}, "gather": {"H5PY_NEVER_USE_MPI": "1"}}
+    proc = support.run([sys.executable, worker, str(tmp_path)] + (["vlen"] if vlen else []),
+                       3, timeout=300, env=env[h5py_build])
+    assert proc.stdout.strip().splitlines() == [h5py_build, "0", "ok"], proc.stdout + proc.stderr
 
 
 class _Ranks:

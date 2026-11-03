@@ -35,17 +35,27 @@ import os
 
 import numpy as np
 
+from femtools.hdf5_rows import extent, find_rows, unique_rows
+
 EDGES = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))     # dolfin's local edge order
 TRIANGLE_CELL_EDGES = ((1, 2), (0, 2), (0, 1))     # ... and a triangle's
+TRIANGLE_EDGES = ((0, 1), (0, 2), (1, 2))          # a tetrahedron facet's, as a set
 
 #: "on a face" for the repair and the check when the caller gives no tolerance: this
-#: times the box's largest side. A caller whose constraint has its own tolerance passes
-#: that, so the three judge the same nodes alike
+#: times the box's largest side (its extent, wherever the box is). A caller whose
+#: constraint has its own tolerance passes that, so the three judge the same nodes alike
 FACE_RTOL = 1e-8
 
 
-def _face_tol(L, tol):
-    return FACE_RTOL * float(np.max(L)) if tol is None else float(tol)
+def _face_tol(side, tol):
+    """`tol`, or `FACE_RTOL` times `side`, the box's largest side."""
+    return FACE_RTOL * float(side) if tol is None else float(tol)
+
+
+def _owned(mesh):
+    """How many of the mesh's local cells this rank owns: the rest, past dolfin's ghost
+    offset, are ghosts (`ghost_mode` other than "none"), each owned by another rank."""
+    return mesh.topology().ghost_offset(mesh.topology().dim())
 
 
 def _as3(v, fill=0.0):
@@ -70,8 +80,6 @@ def upper_mask(x, L, periodic, tol):
     return m
 
 
-TRIANGLE_EDGES = ((0, 1), (0, 2), (1, 2))
-
 
 def _held(topo, owner, mask, edges):
     """The slave entities each element of `topo` holds, with its rank, distinct, as rows
@@ -88,48 +96,7 @@ def _held(topo, owner, mask, edges):
         va, vb = topo[m, a], topo[m, b]
         rows.append(np.stack([np.ones(len(va), np.int64), np.minimum(va, vb),
                               np.maximum(va, vb), owner[m]], 1))
-    return _unique_rows(np.concatenate(rows).astype(np.int64))
-
-
-def _unique_rows(rows):
-    """`np.unique(rows, axis=0)` for int rows, the same rows in the same order, many times
-    faster than numpy's sort of the rows as one structured value each (the serial repair's
-    largest cost): the columns packed, each from its minimum, into one int64 that sorts in
-    the rows' order when their ranges fit 63 bits (vertex numbers, ranks and the kind do),
-    else a lexsort and a neighbour comparison."""
-    if not len(rows):
-        return rows.reshape(0, rows.shape[1])
-    lo = rows.min(axis=0)
-    bits = [int(w).bit_length() for w in rows.max(axis=0) - lo]
-    if sum(bits) <= 63:
-        key = np.zeros(len(rows), np.int64)
-        for c, b in enumerate(bits):
-            key = (key << b) | (rows[:, c] - lo[c])
-        key = np.unique(key)
-        out = np.empty((len(key), rows.shape[1]), rows.dtype)
-        for c in range(rows.shape[1] - 1, -1, -1):
-            out[:, c] = (key & ((1 << bits[c]) - 1)) + lo[c]
-            key = key >> bits[c]
-        return out
-    s = rows[np.lexsort(rows.T[::-1])]
-    return s[np.r_[True, np.any(s[1:] != s[:-1], axis=1)]]
-
-
-def _find_rows(a, b):
-    """For each row of `a`, the index of the equal row of `b` (unique rows), or -1."""
-    if not len(a) or not len(b):
-        return np.full(len(a), -1, np.int64)
-    both = np.concatenate([b, a])
-    order = np.lexsort(both.T[::-1])
-    s = both[order]
-    first = np.r_[True, np.any(s[1:] != s[:-1], axis=1)]
-    group = np.cumsum(first) - 1
-    head = np.full(group[-1] + 1, -1, np.int64)
-    from_b = order < len(b)
-    head[group[from_b]] = order[from_b]
-    out = np.empty(len(both), np.int64)
-    out[order] = head[group]
-    return out[len(b):]
+    return unique_rows(np.concatenate(rows).astype(np.int64))
 
 
 def _endangered(mask, topo, owner):
@@ -152,7 +119,7 @@ def _endangered(mask, topo, owner):
     cell_edges, facet_edges = _cell_edges(nv)
     held = _held(topo, owner, mask, cell_edges)
     seen = _held(ff[ext], owner[fcell[ext]], mask, facet_edges)
-    bad = held[_find_rows(held, seen) < 0]
+    bad = held[find_rows(held, seen) < 0]
     # seen is sorted: the first row of each entity has its lowest rank
     if len(seen):
         first = np.r_[True, np.any(seen[1:, :3] != seen[:-1, :3], axis=1)]
@@ -189,7 +156,7 @@ def _repair(mask, topo, owner, max_rounds=50):
         bad, (keys, low) = _endangered(mask, topo, owner)
         if not len(bad):
             return owner, moved
-        at = _find_rows(bad[:, :3], keys)
+        at = find_rows(bad[:, :3], keys)
         if (at < 0).any():
             k = bad[at < 0][0]
             raise RuntimeError('a slave {} {} has no exterior facet on any rank'.format(
@@ -301,7 +268,9 @@ def _cpp():
 class Rebuild:
     """A mesh's new partition, decided and not yet built: everything the build and the
     arrays' move need (`build`, `carry`), the mesh itself not among them, so a caller can
-    let it go before the new one is built. Each local cell goes to `partition`'s rank; cells keep their global ids,
+    let it go before the new one is built. Each local cell this rank owns goes to
+    `partition`'s rank (ghost cells, past the owned ones, are left to their owners and
+    their entries ignored); cells keep their global ids,
     vertices their global ids and coordinates, bit for bit, the vertices first sent to the
     rank holding their block of the global numbering (`hdf5_rows.to_owners`), as dolfin
     builds a mesh it reads. Collective."""
@@ -314,11 +283,13 @@ class Rebuild:
         # build runs after the caller has let `mesh` go
         self.like = df.Mesh(comm)
         tdim = mesh.topology().dim()
+        own = _owned(mesh)          # a ghost cell is built by the rank owning it
         gv = np.asarray(mesh.topology().global_indices(0), dtype=np.int64)
-        gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)
+        gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)[:own]
         self.n = (mesh.num_entities_global(tdim), mesh.num_entities_global(0))
         self.ids = (gc, gv)
-        cells = np.ascontiguousarray(gv[mesh.cells()])
+        cells = np.ascontiguousarray(gv[mesh.cells()[:own]])
+        partition = np.asarray(partition)[:own]
         edges = block_edges(self.n[1], comm.size)
         got_i, got_x = to_owners(comm, edges, gv, mesh.coordinates())
         lo, hi = int(edges[comm.rank]), int(edges[comm.rank + 1])
@@ -601,10 +572,11 @@ ITR = 1000.0
 
 
 def parmetis_partition(mesh, adaptive=True):
-    """Each local cell's rank from ParMETIS on its dual graph: `AdaptiveRepart` from the
-    current partition, or `PartKway` from scratch. Collective."""
+    """Each owned local cell's rank from ParMETIS on its dual graph: `AdaptiveRepart` from
+    the current partition, or `PartKway` from scratch. Collective."""
     gv = np.asarray(mesh.topology().global_indices(0), dtype=np.int64)
-    return _parmetis(mesh, dual_csr(np.ascontiguousarray(gv[mesh.cells()]), mesh.mpi_comm()),
+    cells = mesh.cells()[:_owned(mesh)]
+    return _parmetis(mesh, dual_csr(np.ascontiguousarray(gv[cells]), mesh.mpi_comm()),
                      adaptive)
 
 
@@ -694,27 +666,26 @@ class Families:
         return self.partition(like, rows)
 
 
-def _box(mesh, L, comm):
-    """L, the box's upper corner, as an array; None means the coordinates' largest values
-    (the repair looks at the upper faces alone, so the lower corner does not matter)."""
-    if L is not None:
-        return np.asarray(L, float)
-    from mpi4py import MPI
-    x = mesh.coordinates()
-    local = x.max(axis=0) if len(x) else np.full(mesh.geometry().dim(), -np.inf)
-    return np.array([comm.allreduce(float(v), op=MPI.MAX) for v in local])
+def _box(x, L, comm, gdim):
+    """`(L, side)`: the box's upper corner as an array -- None means the coordinates'
+    largest values (the repair looks at the upper faces alone) -- and the largest side of
+    the coordinates' extent, which scales the face tolerance wherever the box is."""
+    lo, hi = extent(x, comm, gdim)
+    return (hi if L is None else np.asarray(L, float)), float(np.max(hi - lo))
 
 
 def _moves(mesh, L, periodic, comm, log, owner, tol=None):
     """The cells the repair moves, as `(global cell id, from rank, to rank)` on every
-    rank, from `owner` (each local cell's proposed rank)."""
-    tol = _face_tol(L, tol)
-    vmask = upper_mask(mesh.coordinates(), L, periodic, tol)
+    rank, from `owner` (each owned local cell's proposed rank)."""
+    x = mesh.coordinates()
+    L, side = _box(x, L, comm, mesh.geometry().dim())
+    vmask = upper_mask(x, L, periodic, _face_tol(side, tol))
     tdim = mesh.topology().dim()
-    cells = np.asarray(mesh.cells(), np.int64).reshape(-1, tdim + 1)
+    own = _owned(mesh)
+    cells = np.asarray(mesh.cells(), np.int64).reshape(-1, tdim + 1)[:own]
     cmask = vmask[cells]
     gv = np.asarray(mesh.topology().global_indices(0), dtype=np.int64)
-    gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)
+    gc = np.asarray(mesh.topology().global_indices(tdim), dtype=np.int64)[:own]
     return _layer_moves(comm, gc, gv[cells], cmask, owner, log)
 
 
@@ -768,26 +739,31 @@ def _apply_moves(gc, part, moves):
     return part
 
 
-def repaired_partition(mesh, part, L, periodic, comm, log=print):
-    """`part` (each local cell's rank) with the repair's moves applied: a partition the
-    periodic dofmap cannot get wrong, decided before anything is built. Collective."""
-    moves = _moves(mesh, _box(mesh, L, comm), periodic, comm, log, owner=part)
-    gc = np.asarray(mesh.topology().global_indices(mesh.topology().dim()), dtype=np.int64)
+def repaired_partition(mesh, part, L, periodic, comm, log=print, tol=None):
+    """`part` (each owned local cell's rank) with the repair's moves applied: a partition
+    the periodic dofmap cannot get wrong, decided before anything is built. `tol`: how
+    near an upper face a vertex is on it, the constraint's own tolerance (default
+    `FACE_RTOL` times the box's largest side). Collective."""
+    own = _owned(mesh)
+    part = np.asarray(part)[:own]
+    moves = _moves(mesh, L, periodic, comm, log, part, tol)
+    gc = np.asarray(mesh.topology().global_indices(mesh.topology().dim()),
+                    dtype=np.int64)[:own]
     return _apply_moves(gc, part, moves), len(moves)
 
 
-def repaired(mesh, L, periodic, comm, log=print):
+def repaired(mesh, L, periodic, comm, log=print, tol=None):
     """A distributed mesh whose partition the periodic dofmap cannot get wrong.
 
     Returned as it is when no cell needs moving, which is the usual case. Otherwise it
     is built again in memory with the moved cells on their new ranks (`rebuild`). No rank
     ever holds the whole mesh. Any rank-local map onto `mesh` -- a parent-cell chain --
-    does not survive a move; global cell ids do.
+    does not survive a move; global cell ids do. `tol` as `repaired_partition`'s.
     """
     if comm.size == 1:
         return mesh
-    part, moved = repaired_partition(mesh, np.full(mesh.num_cells(), comm.rank), L,
-                                     periodic, comm, log)
+    part, moved = repaired_partition(mesh, np.full(_owned(mesh), comm.rank), L,
+                                     periodic, comm, log, tol)
     return rebuild(mesh, part) if moved else mesh
 
 
@@ -827,7 +803,6 @@ def read_partitioned(mesh_file, L, periodic, comm, log=print, tol=None, families
     `Families`, which spares ParMETIS a refined mesh's own dual graph."""
     import dolfin as df
     import h5py
-    from mpi4py import MPI
     from femtools.hdf5_rows import block_edges, lookup
     path, topo_name, coords_name, ids_name = _mesh_datasets(mesh_file)
     with h5py.File(path, 'r') as h:
@@ -845,11 +820,8 @@ def read_partitioned(mesh_file, L, periodic, comm, log=print, tol=None, families
         part = _parmetis(like, dual_csr(cells, comm), adaptive=False)
     else:
         part = np.asarray(families(like, ids, comm), dtype=np.int64)
-    if L is None:
-        local = x.max(axis=0) if len(x) else np.full(gdim, -np.inf)
-        L = np.array([comm.allreduce(float(v), op=MPI.MAX) for v in local])
-    L = np.asarray(L, float)
-    vmask = upper_mask(x, L, periodic, _face_tol(L, tol))
+    L, side = _box(x, L, comm, gdim)
+    vmask = upper_mask(x, L, periodic, _face_tol(side, tol))
     cmask = lookup(comm, ve, vmask, cells.reshape(-1)).reshape(cells.shape)
     part = _apply_moves(ids, part, _layer_moves(comm, ids, cells, cmask, part, log))
     data = _cpp().local_data(like, cells, ids, x, lo, n_v, n_c, part.astype(np.int32))
@@ -948,7 +920,7 @@ def repartition_plan(mesh, L, periodic, comm, log=print, propose=None):
         return None
     # within ParMETIS's own tolerance there is nothing to rebalance: it would still move a
     # few hundred cells to polish the cut, and that costs a whole build
-    n = mesh.num_cells()
+    n = _owned(mesh)
     if comm.allreduce(n, op=MPI.MAX) <= IMBALANCE * comm.allreduce(n, op=MPI.SUM) / comm.size:
         return None
     part = parmetis_partition(mesh) if propose is None else propose(mesh)
@@ -976,7 +948,8 @@ def check_pairing(W, L, periodic, comm, tol=None, lower=None):
            L, periodic, comm, 'the Stokes space', tol=tol, lower=lower)
 
 
-def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None, lower=None):
+def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None, lower=None,
+                        tol=None):
     """`check_pairing` for a Lagrange space of degree 1 or 2, scalar or vector (its first
     component stands for the rest: the components share one dofmap layout).
 
@@ -990,7 +963,7 @@ def check_space_pairing(V, L, periodic, comm, what='the space', exempt=None, low
                          .format(degree))
     dm = V.sub(0).dofmap() if V.num_sub_spaces() else V.dofmap()
     _check(V.mesh(), [(dm, _nodes_a_cell(V.mesh().topology().dim(), degree))], L, periodic,
-           comm, what, exempt, lower=lower)
+           comm, what, exempt, tol=tol, lower=lower)
 
 
 def _pad3(x):
@@ -1003,21 +976,18 @@ def _check(mesh, dofmaps, L, periodic, comm, what, exempt=None, tol=None, lower=
     """Every face node, in every (dofmap, nodes a cell) given, one dof per periodic class.
     Triangle and tetrahedron meshes; the box runs from `lower` (default the origin) to
     `L`."""
-    from femtools.periodic import cell_dofs
+    from femtools.periodic import cell_dofs, on_planes
     x = _pad3(mesh.coordinates())
     nv = mesh.topology().dim() + 1
     cells = np.asarray(mesh.cells(), np.int64).reshape(-1, nv)
     L = np.array(_as3(L), float)
     lo = np.zeros(3) if lower is None else np.array(_as3(lower), float)
     periodic = _as3(periodic, False)
-    tol = _face_tol(L - lo, tol)
+    tol = _face_tol(np.max(L - lo), tol)
     axes = [a for a in range(3) if periodic[a]]
     if not axes:
         return
-    on = np.zeros(len(x), bool)
-    for a in axes:
-        on |= (np.abs(x[:, a] - lo[a]) < tol) | (np.abs(x[:, a] - L[a]) < tol)
-    touching = np.nonzero(on[cells].any(1))[0]
+    touching = np.nonzero(on_planes(x, lo, L, axes, tol)[cells].any(1))[0]
     # the nodes of every touching cell -- vertices, then edge midpoints in dolfin's
     # local edge order -- and which of them lie on a periodic face. Vectorised, with
     # the cells' dofs fetched in one compiled call (dolfin's Python has no bulk
@@ -1026,9 +996,7 @@ def _check(mesh, dofmaps, L, periodic, comm, what, exempt=None, tol=None, lower=
     edges = EDGES if nv == 4 else TRIANGLE_CELL_EDGES
     nodes = np.concatenate(
         [xv, np.stack([(xv[:, a] + xv[:, b]) / 2 for a, b in edges], 1)], 1)
-    face = np.zeros(nodes.shape[:2], bool)
-    for a in axes:
-        face |= (np.abs(nodes[..., a] - lo[a]) < tol) | (np.abs(nodes[..., a] - L[a]) < tol)
+    face = on_planes(nodes, lo, L, axes, tol)
     pos = nodes[face]
     dofs = []
     for dm, n in dofmaps:
@@ -1075,7 +1043,7 @@ def _split_classes(comm, pos, dofs, L, axes, tol, exempt, lower=None):
     rows = np.concatenate([_keys(pos, tol).reshape(-1, 3), _keys(img, tol),
                            as_rows(dofs)], 1)
     rows = rows[(rows[:, 6:] >= 0).any(1)] if rows.shape[1] > 6 else rows
-    rows = np.unique(rows, axis=0) if len(rows) else rows.reshape(0, rows.shape[1])
+    rows = unique_rows(rows)
     if exempt is None:
         ex = np.zeros(len(rows), np.int64)
     else:
@@ -1083,15 +1051,7 @@ def _split_classes(comm, pos, dofs, L, axes, tol, exempt, lower=None):
         r_rows = route(comm, rank_of(rows[:, :3], size), rows)
         r_ex = route(comm, rank_of(mine, size), mine)
         got, ex_keys = r_rows.received[0], r_ex.received[0]
-        if len(got) and len(ex_keys):
-            both = np.concatenate([ex_keys, got[:, :3]])
-            _, inv = np.unique(both, axis=0, return_inverse=True)
-            inv = inv.reshape(-1)
-            is_ex = np.zeros(inv.max() + 1, bool)
-            is_ex[inv[:len(ex_keys)]] = True
-            flag = is_ex[inv[len(ex_keys):]]
-        else:
-            flag = np.zeros(len(got), bool)
+        flag = find_rows(got[:, :3], unique_rows(ex_keys)) >= 0
         rows, ex = got, flag.astype(np.int64)
     r = route(comm, rank_of(rows[:, 3:6], size), rows[:, 3:], ex)
     got, ex = r.received
@@ -1107,7 +1067,7 @@ def _split_classes(comm, pos, dofs, L, axes, tol, exempt, lower=None):
         for j in range(got.shape[1] - 3):
             d = got[:, 3 + j]
             m = d >= 0
-            pairs = np.unique(np.stack([cls[m], d[m]], 1), axis=0)
+            pairs = unique_rows(np.stack([cls[m], d[m]], 1))
             many |= np.bincount(pairs[:, 0], minlength=n_cls) > 1
         split = int(np.count_nonzero(many & ~forgiven))
     return comm.allreduce(split, op=MPI.SUM)

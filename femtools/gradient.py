@@ -4,8 +4,7 @@ __copyright__ = "Copyright (C) 2013 " + __author__
 __license__ = "GNU Lesser GPL version 3 or any later version"
 import os
 import cppimport
-import petsc4py
-from dolfin import info, Function, FunctionSpace, assemble, TrialFunction, TestFunction, dx, Matrix, as_backend_type
+from dolfin import Function, FunctionSpace, assemble, TrialFunction, TestFunction, dx
 
 compiled_gradient_module = cppimport.imp_from_filepath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp", "gradient_weight.cpp"),
@@ -53,26 +52,15 @@ def weighted_gradient_matrix(mesh, i, family='CG', degree=1, constrained_domain=
     else:
         raise ValueError('Only CG and CR families are allowed.')
 
-    G = assemble(TrialFunction(DG)*TestFunction(T)*dx)
-    dg = Function(DG)
-    if isinstance(i, (tuple, list)):
-        CC = []
-        for ii in i:
-            dP = assemble(TrialFunction(S).dx(ii)*TestFunction(DG)*dx)
-            A = Matrix(G)
-            C = compiled_gradient_module.compute_weighted_gradient_matrix(A, dP, dg)
-            #compiled_gradient_module.compute_DG0_to_CG_weight_matrix(A, dg)
-            #C = assemble(TrialFunction(S)*TestFunction(T)*dx)
-            #A_mat = as_backend_type(A).mat()
-            #A_mat.matMult(as_backend_type(dP).mat(), result=as_backend_type(C).mat())
-            CC.append(C)
-        return CC
-    else:
-        dP = assemble(TrialFunction(S).dx(i)*TestFunction(DG)*dx)
-        C = compiled_gradient_module.compute_weighted_gradient_matrix(G, dP, dg)
-        #compiled_gradient_module.compute_DG0_to_CG_weight_matrix(G, dg)
-        #G_mat = as_backend_type(G).mat()
-        #C = assemble(TrialFunction(S)*TestFunction(T)*dx)
-        #G_mat.matMult(as_backend_type(dP).mat(), result=as_backend_type(C).mat())
-        return C
+    # the averaging matrix (target dofs x cells) is the same for every direction: built
+    # once, and multiplied into each direction's cell gradients
+    A = assemble(TrialFunction(DG)*TestFunction(T)*dx)
+    compiled_gradient_module.compute_DG0_to_CG_weight_matrix(A, Function(DG))
 
+    def direction(ii):
+        dP = assemble(TrialFunction(S).dx(ii)*TestFunction(DG)*dx)
+        return compiled_gradient_module.matMatMult(A, dP)
+
+    if isinstance(i, (tuple, list)):
+        return [direction(ii) for ii in i]
+    return direction(i)
