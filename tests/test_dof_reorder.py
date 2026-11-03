@@ -13,6 +13,7 @@ from femtools import dof_reorder  # noqa: E402
 
 @pytest.mark.skipif(not (shutil.which('c++') and shutil.which('pkg-config')
                          and shutil.which('objdump')), reason='needs c++, pkg-config, objdump')
+@pytest.mark.slow
 def test_builds_with_libdolfins_symbol(tmp_path):
     out = str(tmp_path / 'libdof_reorder_star.so')
     try:

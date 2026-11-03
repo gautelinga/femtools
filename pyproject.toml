@@ -32,6 +32,7 @@ femtools = ["cpp/*.cpp", "cpp/*.h"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not slow'"
 filterwarnings = ["ignore::DeprecationWarning:ffc.*"]
 markers = [
     "dolfin: needs legacy dolfin",
