@@ -200,8 +200,8 @@ std::vector<double> GradProbe::get_probe_at_snapshot(std::size_t i)
 }
 std::vector<double> GradProbe::get_probe_grad_at_snapshot(std::size_t i)
 {
-  std::vector<double> x(_value_size_loc * _element->space_dimension());
-  for (std::size_t j = 0; j < _value_size_loc * _element->space_dimension(); j++)
+  std::vector<double> x(_value_size_loc * _geom_dim);
+  for (std::size_t j = 0; j < _value_size_loc * _geom_dim; j++)
     x[j] = _probes_grad[j][i];
   return x;
 }

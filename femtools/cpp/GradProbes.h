@@ -65,6 +65,7 @@ namespace dolfin
 
     // Return number of evaluations of probes
     std::size_t number_of_evaluations() {return _num_evals;};
+    std::size_t number_of_grad_evaluations() {return _num_grad_evals;};
 
     // Erase one snapshot ot the all probes
     virtual void erase_snapshot(std::size_t i);

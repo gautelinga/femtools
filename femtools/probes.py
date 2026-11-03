@@ -200,7 +200,7 @@ class GradProbes(probe11.GradProbes):
         if not N is None:
             z  = zeros((size, comp))
         else:
-            z  = zeros((size, comp, self.number_of_evaluations()))
+            z  = zeros((size, comp, self.number_of_grad_evaluations()))
 
         # Get all values
         if len(self) > 0:
@@ -217,7 +217,7 @@ class GradProbes(probe11.GradProbes):
                     if not N is None:
                         z[j, :] = probe.get_probe_grad_at_snapshot(N)
                     else:
-                        for k in range(self.value_size()):
+                        for k in range(comp):
                             z[j, k, :] = probe.get_probe_grad_sub(k)
 
         # Collect values on root
