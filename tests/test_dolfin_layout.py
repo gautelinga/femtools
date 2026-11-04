@@ -34,7 +34,7 @@ def test_the_same_file_as_dolfin_writes_but_compressed(ranks, h5py_build, tmp_pa
     writes, and dolfin reads it back"""
     proc = support.run([sys.executable, WORKER, str(tmp_path)], ranks, timeout=600,
                        env=H5PY.get(h5py_build))
-    lines = proc.stdout.strip().splitlines()
+    lines = support.lines(proc.stdout)
     assert lines and all(line.endswith(": same") for line in lines), proc.stdout
     assert len(lines) == 2 + 3 + 1 + 2 * 5, proc.stdout     # groups and datasets
 
@@ -48,7 +48,7 @@ def test_tables_written_once_and_linked(tmp_path):
     def run(ranks, *args):
         proc = support.run([sys.executable, LINKED, str(tmp_path)] + list(args), ranks,
                            timeout=600)
-        return proc.stdout.strip().splitlines()[1:]
+        return support.lines(proc.stdout)[1:]
     run(1, "tables")
     assert run(3, "link", "tables_1.h5") == [
         "read back: same", "read back moved: same", "other element: refused",

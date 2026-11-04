@@ -1,0 +1,72 @@
+name: tests
+
+# Legacy dolfin 2019.2 from the FEniCS PPA, installed with apt on the Ubuntu 24.04
+# runner -- the same setup as the development machine and as twoasis's CI. Everything
+# else comes from apt too, so h5py uses dolfin's (parallel) HDF5, NumPy is the one dolfin
+# was built against, and mpirun is Ubuntu's Open MPI.
+#
+# The whole suite, the slow and MPI tests with it, runs on every push and pull request
+# (a few minutes), and weekly, so a change in the PPA shows without a push.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      OMP_NUM_THREADS: "1"
+      FEMTOOLS_REQUIRE_MPI: "1"  # fail, rather than skip, the parallel tests
+      # more ranks than the runner's cores (a test uses 6)
+      OMPI_MCA_rmaps_base_oversubscribe: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: legacy dolfin from the FEniCS PPA, and femtools
+        run: |
+          sudo add-apt-repository -y ppa:fenics-packages/fenics
+          sudo apt-get update -qq
+          # libdolfin-dev, pybind11-dev and g++: dolfin compiles at run time, and femtools
+          # its C++ helpers (cppimport); libparmetis-dev: the periodic partitioner.
+          # python3-h5py is the wrapper that makes `import h5py` load the MPI build
+          # under mpirun and the serial one otherwise: both builds, named, since
+          # --no-install-recommends takes one alternative only; meshio: xdmfread's test.
+          sudo apt-get install -y --no-install-recommends \
+            python3-dolfin python3-mpi4py python3-petsc4py \
+            python3-h5py python3-h5py-serial python3-h5py-mpi \
+            python3-scipy python3-cppimport python3-pybind11 python3-meshio \
+            python3-pytest python3-pip \
+            libdolfin-dev libparmetis-dev pybind11-dev g++ pkg-config
+          # --no-deps: a pip numpy or mpi4py would not be the one dolfin uses. Editable:
+          # cppimport builds its modules beside their sources, in the package directory.
+          python3 -m pip install --break-system-packages --no-deps -e .
+      - name: the interpreter has everything the tests need
+        run: |
+          python3 -c "import dolfin, h5py, mpi4py, scipy, cppimport, meshio; print(dolfin.__version__)"
+          python3 -c "import h5py; assert not h5py.get_config().mpi, 'serial h5py missing'"
+          H5PY_ALWAYS_USE_MPI=1 python3 -c "import h5py; assert h5py.get_config().mpi"
+          mpirun -n 2 python3 -c "from mpi4py import MPI; print(MPI.COMM_WORLD.rank)"
+          python3 -c "import femtools.periodic, femtools.xdmf, femtools.hdf5_rows"
+      # dijitso keys by a hash of the generated code, so a stale entry is a miss, not a
+      # wrong answer. A cold cache pays for every compiled helper.
+      - name: JIT cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dijitso
+          key: dijitso-${{ runner.os }}-${{ hashFiles('femtools/**/*.py', 'femtools/cpp/*') }}
+          restore-keys: dijitso-${{ runner.os }}-
+      # the tests that run children (mpirun) first, on their own: a crash in one step
+      # cannot then take the other's report with it
+      - name: MPI tests
+        run: python3 -m pytest -m mpi -v -rs --durations=15
+      - name: the other tests, slow included
+        if: always()
+        run: python3 -m pytest -m "not mpi" -v -rs --durations=15

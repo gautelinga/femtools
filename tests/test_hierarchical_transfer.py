@@ -65,11 +65,17 @@ def quadratic_files():
     """mesh.h5 and u.h5 (the quadratic on P2) of the box, written serially once."""
     out = os.path.join(SCRATCH, "quadratic")
     comm = df.MPI.comm_world
-    if df.MPI.rank(comm) == 0 and not os.path.exists(os.path.join(out, "u.h5")):
-        os.makedirs(out, exist_ok=True)
+    # every rank builds the serial mesh and field, rank zero alone writes them: what
+    # dolfin does collectively on first use (PETSc's initialisation, the JIT) is then
+    # done by every rank, where on rank zero alone it waited for ranks in the barrier
+    # (only on a cold JIT cache, as on a fresh CI runner)
+    exists = comm.bcast(os.path.exists(os.path.join(out, "u.h5")), root=0)
+    if not exists:
         mesh = df.BoxMesh(df.MPI.comm_self, df.Point(0, 0, 0), df.Point(*BOX), 8, 8, 16)
-        u = df.interpolate(df.Expression(QUADRATIC, degree=2),
+        u = df.interpolate(df.Expression(QUADRATIC, degree=2, mpi_comm=df.MPI.comm_self),
                            df.VectorFunctionSpace(mesh, "Lagrange", 2))
+    if df.MPI.rank(comm) == 0 and not exists:
+        os.makedirs(out, exist_ok=True)
         with df.HDF5File(df.MPI.comm_self, os.path.join(out, "mesh.h5"), "w") as h5:
             h5.write(mesh, "mesh")
         with df.HDF5File(df.MPI.comm_self, os.path.join(out, "u.h5"), "w") as h5:
@@ -200,11 +206,11 @@ def _spawn(nranks, *args):
 
 @pytest.mark.mpi
 def test_cell_id_roundtrip():
-    """written on 3 ranks, read back on 1, 2 and 3"""
+    """written on 3 ranks, read back on 1 and 2 (other counts than the writer's)"""
     _not_in_a_child()
     out = os.path.join(SCRATCH, "roundtrip")
     _spawn(3, "--write-refined", out)
-    for n in (1, 2, 3):
+    for n in (1, 2):
         assert _spawn(n, "--check-refined", out).count("all rows agree") == n
 
 

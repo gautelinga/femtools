@@ -1459,8 +1459,7 @@ def _run_parallel(path, ranks, force_serial_h5py=False, ghost_mode='none'):
     with open(script, 'w') as handle:
         handle.write(PARALLEL_SCRIPT.format(root=os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))))
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(('OMPI_', 'PMIX_', 'PMI_'))}
+    env = support.clean_env()
     cmd = ['mpirun', '-n', str(ranks)]
     if force_serial_h5py:
         env['H5PY_NEVER_USE_MPI'] = '1'
