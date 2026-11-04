@@ -22,4 +22,4 @@
 dolfin_layout and hierarchical_transfer need numpy and h5py alone, abort, memory and
 dof_reorder the standard library.
 """
-__version__ = "2026.2.0"
+__version__ = "2026.2.1"
